@@ -319,6 +319,14 @@ Index only build-relevant inputs:
 - model metadata files, not raw model binaries unless the checksum changed
 - `.dockerignore`, build scripts, entrypoints, health checks, and package manager config
 
+Exclude non-build paths by default:
+
+- `.opencode`, because it contains agent skills/configuration, not application build inputs
+- `.git`, `.venv`, virtualenvs, caches, test outputs, notebooks, datasets, model binaries, and generated reports
+- dependency/download caches such as pip, uv, BuildKit metadata, wheelhouse output, and package manager caches
+
+Include `.opencode` only when the task is explicitly updating OpenCode skills or configuration; never let application image rebuild decisions depend on scanning `.opencode`.
+
 The index should record file path, size, mtime, checksum, detected role, related runtime variant, and cache key contribution. Rebuild the index only when Git diff, file watcher events, or checksum comparison shows relevant changes.
 
 Use the index to:
@@ -457,7 +465,7 @@ When reviewing or generating an image builder, check:
 Classify failures before changing code:
 
 - Nexus slow: check wheel-only availability, download concurrency, wheelhouse reuse, and response timing.
-- OpenCode indexing slow: check index scope, checksum strategy, ignored directories, large model/data files, file watcher availability, and changed input count.
+- OpenCode indexing slow: check index scope, checksum strategy, ignored directories such as `.opencode` and `.git`, large model/data files, file watcher availability, and changed input count.
 - Closed-network slow: check blocked external URL attempts, missing internal mirrors, DNS/proxy/TLS delays, full project scans, cold wheelhouse, cold BuildKit cache, and Argo queue time.
 - uv slow: check repeated sync, stale lock, cache path, workspace discovery, offline index configuration, filesystem link mode, and whether `--no-sync` is safe.
 - BuildKit slow: check dependency layer invalidation, registry cache import/export, builder CPU/memory, and `.dockerignore`.
