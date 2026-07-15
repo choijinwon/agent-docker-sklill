@@ -1,6 +1,6 @@
 ---
 name: nexus-image-builder
-description: Use when creating, reviewing, or debugging a PyTorch-focused AI/ML container image builder for OpenCode in a closed network, with Nexus wheel-only dependencies, BuildKit, Harbor, Argo Workflows, KServe serving images, Runtime Contract, runtime version matrices, Python/PyTorch/MLflow/Oracle checks, project indexing, bucket artifact performance, Docker size optimization, Build Reports, and failure triage.
+description: Use when creating, reviewing, or debugging a PyTorch-focused AI/ML container image builder for OpenCode in a closed network, with Nexus wheel-only dependencies, BuildKit, Harbor, Argo Workflows, KServe serving images, Runtime Contract, runtime version matrices, multi-model packaging, Python/PyTorch/MLflow/Oracle checks, project indexing, bucket artifact performance, Docker size optimization, Build Reports, and failure triage.
 ---
 
 # Nexus AI/ML Image Builder
@@ -34,7 +34,7 @@ Validate:
 - lock file path and lock hash
 - Nexus repository, wheel-only policy, and wheelhouse manifest
 - Harbor release repository and BuildKit cache repository
-- model/artifact source, checksum, and packaging mode
+- model/artifact source, checksum, packaging mode, and model list when multiple models are used
 - security policy: non-root, digest pinning, latest ban, SBOM/provenance/signature
 - report output path and notification target when used
 
@@ -86,9 +86,20 @@ runtime_matrix:
     wheelhouse_key: serving/cp310/linux-amd64/<lock_hash>
 
 artifacts:
-  model_packaging: image          # external | oci-artifact | image
+  model_packaging: image          # external | oci-artifact | image | image-per-model
   manifest: s3://ml-artifacts/models/model-manifest.json
   checksum: sha256:...            # Cache and release decisions use checksum
+  models:                         # Declare every model; do not discover by bucket list
+    - name: churn
+      version: "2026-07-16"
+      format: torchscript         # torchscript | state_dict | safetensors | mlflow
+      uri: s3://ml-artifacts/models/churn/model.pt
+      checksum: sha256:...
+    - name: fraud
+      version: "2026-07-16"
+      format: safetensors
+      uri: s3://ml-artifacts/models/fraud/model.safetensors
+      checksum: sha256:...
 
 build:
   target: release-with-model      # dependencies | test | release | release-with-model
@@ -191,13 +202,23 @@ Rules:
 - Report final image size, largest layers, and model contribution.
 - Do not remove CA certificates, timezone/locale data, health checks, or required diagnostics.
 
-## Model And Bucket Artifacts
+## Multi-Model And Bucket Artifacts
 
 If PVC/NAS is unavailable, choose one:
 
 - object storage or model registry pull at startup when network and credentials are reliable
 - OCI artifact/model layer in Harbor when supported
 - model-in-image when startup reliability matters more than image size or rollout speed
+
+Multi-model rules:
+
+- Declare every model in the artifact manifest with name, version, format, URI, size, checksum, and intended runtime variant.
+- Do not discover models by recursive bucket listing.
+- Prefer one shared PyTorch runtime image plus external/OCI model artifacts when many models change independently.
+- Use `image-per-model` when each model needs independent rollout, rollback, scanning, or image pull control.
+- Use one combined model image only when the models must be deployed atomically and total size is acceptable.
+- Build model layers late so changing one model does not rebuild Python/PyTorch dependency layers.
+- For KServe, choose single-model InferenceService, multi-model serving, or separate InferenceServices explicitly in the spec.
 
 Bucket performance rules:
 
@@ -213,7 +234,7 @@ For model-in-image:
 
 - Copy model files after dependency install and application source decisions.
 - Store under a stable path such as `/models/<model-name>`.
-- Record model name, version, format, size, checksum, and source.
+- Record every model name, version, format, size, checksum, source, and target path.
 - Keep model files out of base, runtime, framework, and application-base images.
 - Scan, sign, and report the final image after the model is included.
 
@@ -282,7 +303,7 @@ Every build should produce JSON with:
 - bucket source, checksum, bytes, object count, download seconds, cache hit/miss
 - BuildKit cache import/export seconds, cache hit rate
 - base image pull seconds, build seconds, Harbor push seconds, Argo queue/wait seconds
-- model packaging mode, model metadata, final image size, largest layer contributors
+- model packaging mode, model count, per-model metadata/checksum/size, final image size, largest layer contributors
 - SBOM/provenance/signature status, non-root/latest/digest policy result
 - failure step, reason, and triage category
 
@@ -300,6 +321,7 @@ Check:
 - Nexus wheelhouse is prepared once and BuildKit installs offline
 - uv does not repeatedly sync for short commands
 - bucket artifacts use manifest/checksum caching instead of repeated prefix scans
+- multiple PyTorch models are declared in a manifest and have explicit packaging, rollout, and cache policy
 - training, serving, and batch images are separated
 - release image excludes tests, compilers, wheelhouse, caches, credentials, and raw unused artifacts
 - MLflow, Oracle, and Python versions are pinned, validated, and reported
@@ -317,7 +339,7 @@ Check:
 - BuildKit slow: check dependency layer invalidation, cache import/export, builder CPU/memory, and `.dockerignore`.
 - Harbor push slow: check image size, push concurrency, release/cache repo split, and network throughput.
 - Image too large: check category separation, CUDA devel base, build tools, wheelhouse/cache leakage, `.dockerignore`, model layer size, and unused dependencies.
-- Model rollout slow: check model size, image pull time, node cache reuse, rollout strategy, and model-in-image tradeoff.
+- Model rollout slow: check per-model size, combined image size, image pull time, node cache reuse, rollout strategy, multi-model routing, and model-in-image tradeoff.
 - Runtime mismatch: compare ABI, Python, PyTorch, CUDA/CPU runtime, MLflow, Oracle, platform, Runtime Contract, and Runtime Lineage.
 - Reproducibility failure: compare parent digest, lock hash, Dockerfile hash, spec hash, source commit, build args, and final digest.
 - Security failure: check non-root user, latest tags, digest pinning, SBOM/provenance/signature, and credential handling.
