@@ -1,6 +1,6 @@
 ---
 name: kserve-argo-workflows
-description: Use when creating, reviewing, or debugging KServe 0.15 model serving projects that use Argo Workflows, including Kubernetes YAML, Python model server code, Docker images, Docker build speed and layer cache checks, package version checks, resource templates, RBAC, storageUri/modelFormat fields, readiness, rollout updates, and inference smoke tests.
+description: Use when creating, reviewing, or debugging KServe 0.15 model serving projects that use Argo Workflows, including Kubernetes YAML, Python model server code, Docker images, BuildKit and Buildx Bake pipelines, Docker build speed and layer cache checks, uv run performance, package version checks, image digest/catalog checks, RBAC, storageUri/modelFormat fields, readiness, rollout updates, and inference smoke tests.
 ---
 
 # KServe 0.15 With Argo Workflows
@@ -68,6 +68,183 @@ python -m pytest
 ```
 
 If the project uses Poetry, uv, or pip-tools, use that tool's native lock and sync commands instead of ad hoc pip installs.
+
+## Feature Implementation Flow
+
+When implementing a serving feature, keep the pipeline complete enough to prove the change works:
+
+1. Update Python code and dependency declarations.
+2. Update Dockerfile and `.dockerignore` if runtime files, packages, or build context changed.
+3. Build and tag the serving image with an immutable tag such as Git SHA or release version; avoid relying on `latest` alone.
+4. Push the image to the registry expected by the cluster.
+5. Update the Argo Workflow or WorkflowTemplate so it deploys that exact image tag.
+6. Apply or patch the KServe `InferenceService`.
+7. Wait for Ready.
+8. Run a smoke test against the expected inference endpoint.
+
+Prefer a single Argo path for repeatable releases:
+
+```text
+build image -> push image -> apply InferenceService -> wait Ready -> smoke test
+```
+
+When the user asks for only skill changes, encode this workflow as guidance in `SKILL.md`; do not create separate workflow YAML unless explicitly requested.
+
+## Argo BuildKit Image Pipeline
+
+When the workflow builds images, prefer a DAG that separates preparation, quality gates, supply-chain metadata, release push, and catalog registration:
+
+```text
+validate-spec
+  -> verify-parent-image
+  -> render-dockerfile
+  -> generate-bake-targets
+  -> build-test-target
+  -> unit-test + smoke-test + security-scan
+  -> generate-sbom-provenance
+  -> build-release-image-and-push
+  -> resolve-image-digest
+  -> cosign-sign-and-attest
+  -> verify-signature
+  -> update-image-catalog
+  -> notify-build-result
+```
+
+Apply these rules:
+
+- Build and test with BuildKit before release push; do not push a release image before unit, smoke, and security gates pass.
+- If the organization uses a quarantine registry, push test images there first, then promote to the release repository after gates pass.
+- Sign with cosign only after the image is pushed and the immutable registry digest is known.
+- Sign and attest `repository@sha256:...`, not a mutable tag.
+- Treat local BuildKit metadata digest and final registry manifest digest as different until verified.
+- Use Argo `dependencies` or `depends` so quality gates block release push.
+- Use `arguments.parameters`, `inputs.parameters`, and `outputs.parameters.valueFrom.path` consistently.
+- Put source, wheelhouse, rendered Dockerfile, Bake file, and reports on a workflow PVC or artifact repository.
+- Use Registry Cache for Docker layers; do not use PVC as a long-term BuildKit cache.
+
+For Buildx Bake:
+
+- Use Bake when multiple targets, platforms, Python versions, CPU/GPU variants, or service images must be managed together.
+- Generate targets from the build spec and keep `docker-bake.hcl` hashable.
+- Use registry cache references separate from final images, for example `harbor.example.com/build-cache/model:buildcache`.
+- Prefer `cache-to=type=registry,ref=...,mode=max` so multi-stage intermediate layers can be reused.
+- Limit concurrency for shared resources such as internal PyPI, BuildKit, and Harbor; more parallelism can increase failure rate.
+
+For BuildKit execution in Kubernetes:
+
+- Prefer remote BuildKit or rootless BuildKit instead of mounting `/var/run/docker.sock`.
+- Keep Git clone, template render, wheel download, and BuildKit execution as separate concerns.
+- If the BuildKit client image lacks Git or package tools, prepare files in an earlier task and pass them through PVC/artifacts.
+- Use BuildKit secrets for credentials. Do not pass registry, Git, PyPI, or cosign secrets through Dockerfile `ARG` or `COPY`.
+
+## Environment Fingerprint And Image Lineage
+
+Before deciding that two builds used the same environment, compare more than the Dockerfile. Define an environment fingerprint from:
+
+- platform and architecture
+- parent image repository, tag, and digest
+- Python, CUDA, framework, and runtime versions
+- dependency lock hash
+- Dockerfile template hash and rendered Dockerfile hash
+- Buildx Bake definition hash
+- build args and relevant environment variables
+- BuildKit and Buildx versions
+- source repository and commit
+- build spec hash
+
+If the fingerprint changes, call out which input changed. Do not promise identical final image digests from identical fingerprints when non-deterministic build steps remain.
+
+Prefer image layers by responsibility:
+
+```text
+Trusted Base -> Runtime -> Framework -> Application Base -> Application Release
+```
+
+Use this split only when it reduces real rebuild time or improves shared governance. Avoid making a new base image for small project-only packages.
+
+Track Runtime Lineage in image labels or catalog metadata:
+
+- lineage id and version
+- trusted base digest
+- runtime digest
+- framework digest
+- application base digest
+- final release digest
+- source commit
+- lock hash
+- Dockerfile hash
+- Bake definition hash
+- SBOM digest
+- provenance digest
+- signature verification result
+- workflow name and UID
+
+Only allow approved Runtime Lineage for release builds when a catalog exists.
+
+## Workflow Schema Repair Rules
+
+When correcting user-provided Argo YAML or JSON, fix common malformed fields before reasoning about behavior:
+
+```text
+madata -> metadata
+lables -> labels
+mangedFields -> managedFields
+input -> inputs
+paramters / paraamters -> parameters
+intiContainers -> initContainers
+severAccountName -> serviceAccountName
+```
+
+Each template must contain one valid template body such as `container`, `script`, `steps`, `dag`, `resource`, or `suspend`. A template with only `name` is not executable.
+
+When users ask for both YAML and JSON, ensure both formats describe the same `WorkflowTemplate`: same task names, templates, parameters, dependencies, volumes, secrets, and output paths.
+
+## uv Run Performance Checks
+
+Use this section when `uv run` feels slow in local development, Docker builds, CI, or Argo steps.
+
+Facts to account for:
+
+- `uv run` ensures the project environment is up-to-date before running the command.
+- `uv run --no-sync ...` avoids syncing the virtual environment and implies `--frozen`.
+- `uv run --frozen ...` runs without updating `uv.lock`.
+- `uv run --locked ...` checks that the lockfile is up-to-date instead of silently re-locking.
+- `uv cache dir` shows the cache directory; `UV_CACHE_DIR` or `--cache-dir` can pin it to a cacheable path.
+
+Diagnose slow `uv run` by checking:
+
+- Whether the command is repeatedly syncing `.venv`.
+- Whether `uv.lock` is missing, stale, or being updated in each run.
+- Whether Docker layers discard `.venv` or the uv cache between builds.
+- Whether `UV_NO_CACHE`, `--no-cache`, or ephemeral cache directories are disabling reuse.
+- Whether the command uses `--with` dependencies, inline script metadata, Git dependencies, or editable local packages that force extra resolution or environment work.
+- Whether the project root is accidentally broad, causing uv to discover the wrong `pyproject.toml`, workspace, or `.venv`.
+
+Recommended patterns:
+
+- For development commands where sync is desired, keep plain `uv run`.
+- For hot paths after a prior `uv sync --frozen`, prefer `uv run --no-sync <cmd>`.
+- For CI where the lockfile must not change, prefer `uv run --locked <cmd>` or `uv run --frozen <cmd>` depending on whether lock freshness should be checked.
+- In Docker, copy `pyproject.toml` and `uv.lock` before source files, run dependency sync in a cacheable layer, then use `uv run --no-sync` for later build/test commands that should not re-sync.
+- In Argo steps, avoid installing or syncing dependencies in every short command container. Build dependencies into the image or add an explicit dependency-prep step with persistent cache only if the cluster supports it.
+
+Example Docker shape with uv cache:
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev
+
+COPY . .
+CMD ["uv", "run", "--no-sync", "python", "-m", "model"]
+```
+
+Do not use `--no-sync` to hide dependency drift. First make the lockfile and environment correct, then skip sync only where repeat execution speed matters.
 
 ## Docker Build Speed And Layers
 
@@ -239,6 +416,11 @@ When reviewing or generating manifests, check:
 - Dockerfile copies dependency files before source files so dependency layers are cacheable.
 - `.dockerignore` excludes large or volatile files that break cache or bloat the serving image.
 - BuildKit cache mounts or wheel caching are considered for slow dependency installs.
+- `uv run` hot paths avoid unnecessary sync only after lockfile/environment correctness is established.
+- CI and Docker builds use `uv.lock`, `--locked`, `--frozen`, or `--no-sync` intentionally instead of accidentally re-resolving each command.
+- BuildKit pipelines keep release push after quality gates and cosign signing after registry digest resolution.
+- Image catalog records final image digest, parent digest, source commit, lock hash, Dockerfile hash, Bake hash, SBOM/provenance digests, and signature verification.
+- PVC/artifacts are used for workflow files and reports; Registry Cache is used for Docker layer reuse.
 
 ## Debugging Commands
 
@@ -247,6 +429,9 @@ Use these commands when diagnosing deployment failures:
 ```bash
 python --version
 python -m pip check
+uv cache dir
+uv run --locked python --version
+docker buildx bake --print
 kubectl get inferenceservice -n <namespace>
 kubectl describe inferenceservice <name> -n <namespace>
 kubectl get pods -n <namespace>
