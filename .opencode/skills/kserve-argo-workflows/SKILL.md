@@ -1,6 +1,6 @@
 ---
 name: kserve-argo-workflows
-description: Use when creating, reviewing, or debugging KServe 0.15 model serving projects that use Argo Workflows, including Kubernetes YAML, Python model server code, Docker images, package version checks, resource templates, RBAC, storageUri/modelFormat fields, readiness, rollout updates, and inference smoke tests.
+description: Use when creating, reviewing, or debugging KServe 0.15 model serving projects that use Argo Workflows, including Kubernetes YAML, Python model server code, Docker images, Docker build speed and layer cache checks, package version checks, resource templates, RBAC, storageUri/modelFormat fields, readiness, rollout updates, and inference smoke tests.
 ---
 
 # KServe 0.15 With Argo Workflows
@@ -68,6 +68,54 @@ python -m pytest
 ```
 
 If the project uses Poetry, uv, or pip-tools, use that tool's native lock and sync commands instead of ad hoc pip installs.
+
+## Docker Build Speed And Layers
+
+When reviewing or writing Dockerfiles for KServe Python serving images, check layer order and cache behavior. Slow builds are often caused by copying the full source tree before dependency installation.
+
+Prefer this layer order:
+
+1. Start from a pinned Python or runtime base image.
+2. Install OS packages in one layer, clean package-manager caches in the same layer.
+3. Copy only dependency declaration and lock files.
+4. Install Python dependencies.
+5. Copy application source and model server code last.
+6. Set runtime command, user, and metadata.
+
+For Python dependencies:
+
+- Copy `requirements.txt`, `pyproject.toml`, `poetry.lock`, `uv.lock`, or generated lock files before `COPY . .`.
+- Use BuildKit cache mounts for pip, uv, Poetry, or apt when the build environment supports it.
+- Prefer wheels or prebuilt artifacts for heavy packages when builds repeatedly compile native extensions.
+- Avoid reinstalling dependencies after every source-code change.
+- Keep model artifacts out of the Docker image when `storageUri` or external model storage is intended.
+- Use `.dockerignore` to exclude `.git`, local virtualenvs, notebooks, test outputs, caches, datasets, model binaries, and build artifacts unless the image explicitly needs them.
+- Avoid `pip install` from unpinned branches or floating URLs in production serving images.
+
+Example cache-friendly shape:
+
+```dockerfile
+# syntax=docker/dockerfile:1.7
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN --mount=type=cache,target=/var/cache/apt \
+    apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m pip install --upgrade pip \
+    && python -m pip install -r requirements.txt
+
+COPY . .
+
+CMD ["python", "-m", "model"]
+```
+
+Do not force this exact Dockerfile. Adapt it to the project's package manager, base image, GPU runtime, and serving entrypoint.
 
 ## Argo Workflow Pattern
 
@@ -188,6 +236,9 @@ When reviewing or generating manifests, check:
 - GPU resources, node selectors, tolerations, and runtime class are included only when the model/runtime needs them.
 - Python version and dependency pins are checked against the serving image and KServe 0.15 target.
 - Package lock files are updated when dependency declarations change.
+- Dockerfile copies dependency files before source files so dependency layers are cacheable.
+- `.dockerignore` excludes large or volatile files that break cache or bloat the serving image.
+- BuildKit cache mounts or wheel caching are considered for slow dependency installs.
 
 ## Debugging Commands
 
