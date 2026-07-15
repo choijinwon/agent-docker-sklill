@@ -1,6 +1,6 @@
 ---
 name: nexus-image-builder
-description: Use when creating, reviewing, or debugging an AI/ML container image builder that uses Nexus PyPI wheel-only dependencies, BuildKit, Harbor, Runtime Contract, runtime version matrices, Oracle client version checks, Runtime Lineage, declarative builder specs, dependency caching, Docker image size optimization, digest-based reproducibility, image build reports, and training/serving/batch image separation.
+description: Use when creating, reviewing, or debugging an AI/ML container image builder that uses Nexus PyPI wheel-only dependencies, BuildKit, Harbor, OpenCode closed-network performance optimization, Runtime Contract, runtime version matrices, Oracle client version checks, Runtime Lineage, declarative builder specs, dependency caching, Docker image size optimization, digest-based reproducibility, image build reports, and training/serving/batch image separation.
 ---
 
 # Nexus AI/ML Image Builder
@@ -20,6 +20,8 @@ Before generating Dockerfiles, Argo workflows, or builder code, require a declar
 Validate at least:
 
 - source repository, branch or commit, repository name
+- network mode: closed-network, proxy-only, or internet-allowed
+- project index path and index hash when OpenCode indexing is used
 - image category: `training`, `serving`, `batch`, or shared runtime/base
 - runtime matrix or single runtime variant id when multiple Python/framework versions are supported
 - runtime contract id and version
@@ -33,6 +35,7 @@ Validate at least:
 - target platform and architecture
 - BuildKit target: `dependencies`, `test`, or `release`
 - Harbor image repository, immutable tag, and cache repository
+- offline mirror endpoints and cache repositories for Nexus, Harbor, base images, BuildKit, uv, pip, OS packages, and model artifacts
 - security policy: non-root, digest pinning, latest tag ban, SBOM/provenance/signature requirements
 - report output path and notification destination when used
 
@@ -301,12 +304,73 @@ Check:
 
 For uv projects, avoid repeated `uv run` sync in short tasks. Prepare dependencies once with `uv sync --frozen` or an equivalent wheel preparation step, then use `uv run --no-sync` only after correctness is established.
 
+## OpenCode Closed-Network Performance
+
+When OpenCode runs in a closed network, optimize for zero external wait and high cache reuse before changing Dockerfiles.
+
+Do not repeatedly search the whole project during each build. Create a project build index, then use the index and file hashes to decide what must be rebuilt.
+
+Index only build-relevant inputs:
+
+- builder spec files such as `image-builder.spec.json`
+- Dockerfiles, Bake files, Argo workflow templates, and KServe manifests
+- dependency files: `pyproject.toml`, `uv.lock`, `requirements*.txt`, lock files, constraints, wheelhouse manifests
+- runtime contract, Runtime Lineage, and image catalog files
+- model metadata files, not raw model binaries unless the checksum changed
+- `.dockerignore`, build scripts, entrypoints, health checks, and package manager config
+
+The index should record file path, size, mtime, checksum, detected role, related runtime variant, and cache key contribution. Rebuild the index only when Git diff, file watcher events, or checksum comparison shows relevant changes.
+
+Use the index to:
+
+- skip dependency resolution when lock/spec/runtime contract hashes did not change
+- skip wheelhouse preparation when wheelhouse manifest and lock hash match
+- skip Dockerfile rendering when templates and spec hash did not change
+- scope Argo matrix rows to changed runtime variants
+- explain cache hit/miss without scanning the whole repository
+
+Run a preflight before build:
+
+- verify every configured endpoint is internal: Git, Nexus, Harbor, base image registry, OS package mirror, model registry/object store, SBOM/signing endpoints
+- load or refresh the project build index before dependency and Docker steps
+- fail fast when a tool tries to reach public PyPI, Docker Hub, GitHub, apt/yum upstreams, or model download URLs
+- check DNS, TLS, proxy, and credentials once, then reuse the result across matrix rows
+- resolve parent image digests before BuildKit starts
+- verify wheelhouse completeness before dependency install
+- import BuildKit registry cache before building
+
+Performance defaults:
+
+- set pip/uv to offline or internal-index mode; do not allow fallback to the internet
+- use a persistent uv cache and wheelhouse keyed by `python_abi`, platform, lock hash, and runtime variant
+- use `uv run --no-sync` for short commands after `uv sync --frozen` has succeeded
+- keep `UV_LINK_MODE=copy` or another environment-approved mode when filesystem links are slow or unsupported
+- keep Argo workspaces, BuildKit cache, and wheelhouse storage on fast internal storage
+- cap matrix concurrency to protect Nexus and Harbor; increase BuildKit concurrency only after cache hit rate is healthy
+- separate BuildKit cache images from release images, and prune only by policy, not on every run
+- prefer prebuilt runtime/framework images over rebuilding heavy dependency layers per project
+
+Measure and report:
+
+- preflight seconds
+- project index refresh seconds and changed input count
+- Nexus wheel lookup/download seconds
+- uv sync seconds and `uv run` seconds
+- BuildKit cache import/export seconds and cache hit rate
+- base image pull seconds
+- Harbor push seconds
+- Argo queue/wait seconds per step
+
+If a closed-network build is slow, first identify whether time is spent waiting for blocked external URLs, missing mirrors, full project scans, cold wheelhouse, repeated uv sync, BuildKit cache miss, image pull/push, or Argo scheduling.
+
 ## Builder Pipeline
 
 Prefer this flow:
 
 ```text
 validate-build-spec
+  -> load-or-refresh-project-index
+  -> closed-network-preflight
   -> expand-runtime-matrix
   -> verify-runtime-contract
   -> resolve-parent-digest
@@ -337,6 +401,8 @@ Include:
 - workflow name, workflow UID, status, timestamp
 - builder spec hash
 - source repository and commit
+- network mode and closed-network preflight result
+- project index hash, refresh seconds, and changed input count when indexing is used
 - runtime variant id and matrix row hash when matrix builds are used
 - image category and runtime contract
 - runtime lineage id/version
@@ -348,6 +414,9 @@ Include:
 - Nexus repository
 - wheel count, total bytes, download seconds, average throughput
 - dependency cache hit/miss
+- uv sync seconds, uv run seconds, and offline/index mode when uv is used
+- BuildKit cache import/export seconds and cache hit rate when available
+- base image pull seconds and Argo queue/wait seconds when available
 - model packaging mode, model name/version/checksum/size when present
 - final image size, release-without-model size when available, and largest layer contributors
 - BuildKit cache hit/miss when available
@@ -363,6 +432,8 @@ Use the report to explain whether the bottleneck is Nexus download, dependency i
 When reviewing or generating an image builder, check:
 
 - A declarative builder spec exists and is validated before rendering.
+- Closed-network mode has explicit internal mirrors, offline behavior, and a preflight gate.
+- OpenCode uses a project build index instead of repeated full-repository scans.
 - Runtime Contract is explicit and digest-based.
 - Multiple Python/framework/runtime versions are represented as explicit matrix variants, not hidden conditionals inside one image.
 - Same-environment comparison uses ABI/framework/Python/platform/lock/spec, not image name alone.
@@ -370,6 +441,7 @@ When reviewing or generating an image builder, check:
 - Dockerfile stages are `base`, `dependencies`, `test`, and `release` or an equivalent clear structure.
 - Dependency layers are isolated from application source layers.
 - Nexus wheelhouse is prepared once and BuildKit installs offline.
+- uv does not repeatedly sync for short commands after frozen dependency preparation succeeds.
 - Release image excludes tests, compilers, wheelhouse, caches, and credentials.
 - MLflow is included only when needed, pinned to the user-provided version, resolved from Nexus wheels, and recorded in the report.
 - Oracle client and Python Oracle driver versions are pinned, validated in the final image, and recorded when Oracle is used.
@@ -385,7 +457,9 @@ When reviewing or generating an image builder, check:
 Classify failures before changing code:
 
 - Nexus slow: check wheel-only availability, download concurrency, wheelhouse reuse, and response timing.
-- uv slow: check repeated sync, stale lock, cache path, workspace discovery, and whether `--no-sync` is safe.
+- OpenCode indexing slow: check index scope, checksum strategy, ignored directories, large model/data files, file watcher availability, and changed input count.
+- Closed-network slow: check blocked external URL attempts, missing internal mirrors, DNS/proxy/TLS delays, full project scans, cold wheelhouse, cold BuildKit cache, and Argo queue time.
+- uv slow: check repeated sync, stale lock, cache path, workspace discovery, offline index configuration, filesystem link mode, and whether `--no-sync` is safe.
 - BuildKit slow: check dependency layer invalidation, registry cache import/export, builder CPU/memory, and `.dockerignore`.
 - Harbor push slow: check image size, push concurrency, release/cache repository split, and network throughput.
 - Image too large: check image category separation, CUDA devel base usage, build tools in release, wheelhouse/cache leakage, `.dockerignore`, model layer size, and unused dependencies.
