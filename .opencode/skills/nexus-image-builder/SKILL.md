@@ -1,0 +1,242 @@
+---
+name: nexus-image-builder
+description: Use when creating, reviewing, or debugging an AI/ML container image builder that uses Nexus PyPI wheel-only dependencies, BuildKit, Harbor, Runtime Contract, Runtime Lineage, declarative builder specs, dependency caching, digest-based reproducibility, image build reports, and training/serving/batch image separation.
+---
+
+# Nexus AI/ML Image Builder
+
+Use this skill for AI/ML image builder work where the goal is not just a faster Docker build, but a standard, auditable image-building system.
+
+## Core Position
+
+Treat Nexus as a wheel-only package source. Put standardization, cache reuse, security, reproducibility, and reporting in the Builder.
+
+Do not assume download speed is the main bottleneck. First check image structure, dependency/application layer separation, BuildKit cache, Runtime Contract, and report/digest policy.
+
+## Required Inputs
+
+Before generating Dockerfiles, Argo workflows, or builder code, require a declarative builder spec such as `image-builder.spec.json`.
+
+Validate at least:
+
+- source repository, branch or commit, repository name
+- image category: `training`, `serving`, `batch`, or shared runtime/base
+- runtime contract id and version
+- runtime image reference and digest
+- Python ABI and version
+- CUDA/framework/runtime versions when applicable
+- dependency lock file and lock hash
+- Nexus PyPI repository and wheel-only policy
+- target platform and architecture
+- BuildKit target: `dependencies`, `test`, or `release`
+- Harbor image repository, immutable tag, and cache repository
+- security policy: non-root, digest pinning, latest tag ban, SBOM/provenance/signature requirements
+- report output path and notification destination when used
+
+Fail early when any required digest, lock hash, runtime contract, or image category is missing.
+
+## 9 Requirements
+
+Implement and review against these requirements:
+
+1. Runtime Contract: common runtime environments must be fixed by digest.
+2. Same Environment Criteria: compare ABI, framework, Python, CUDA, platform, lock hash, and builder spec, not image name alone.
+3. Runtime Lineage: manage images by lineage, role, project, and parent digest chain.
+4. Training/Serving Separation: keep training, serving, and batch images separate; distinguish strict and optimized runtime patterns.
+5. Declarative Builder Spec: centralize layer, target, validation, and report rules.
+6. Multi-stage Target: separate dependency, test, and release targets; push only release targets after gates pass.
+7. Externalize Models: do not bake model artifacts into application images unless explicitly required; inject models through artifact storage, PVC, object storage, or runtime loading.
+8. Security and Reproducibility: require digest, lock hash, non-root user, latest tag ban, report, and policy checks.
+9. Wheel Repository: use Nexus wheel-only download and dependency cache reuse.
+
+## Image Categories
+
+Choose the image category before writing Dockerfile stages:
+
+- `training`: includes training libraries, notebooks only if required, distributed training tools, and heavier debug dependencies.
+- `serving`: minimal runtime for online inference; optimized startup, size, health check, and non-root runtime.
+- `batch`: offline inference or scheduled jobs; may include data connectors and batch orchestration tools.
+- `runtime-base`: organization-approved language/runtime base image.
+- `framework`: shared PyTorch/TensorFlow/MLflow/FastAPI framework image.
+- `application-base`: project or service-family shared dependencies without service-specific source.
+- `release`: final deployable application image.
+
+Do not combine training, serving, and batch requirements into one image unless the user explicitly chooses that tradeoff.
+
+## Runtime Contract
+
+Use Runtime Contract as the approved execution environment boundary.
+
+Include:
+
+- contract id and version
+- parent image repository and digest
+- operating system and architecture
+- Python ABI and exact Python version
+- CUDA, cuDNN, NCCL, PyTorch/TensorFlow versions when used
+- common runtime packages
+- expected user id and filesystem permissions
+- allowed package sources
+- supported image categories
+- health check and entrypoint conventions
+
+The builder must reject or flag builds that mix incompatible Python ABI, CUDA, framework, or parent image digest.
+
+## Runtime Lineage
+
+Track images through this chain:
+
+```text
+Trusted Base -> Runtime -> Framework -> Application Base -> Application Release
+```
+
+Record at least:
+
+- lineage id and version
+- image role/category
+- project or service owner
+- parent image digest
+- runtime/framework/application-base digest chain
+- source commit
+- lock hash
+- builder spec hash
+- Dockerfile hash
+- BuildKit/Bake hash
+- final image digest
+- SBOM/provenance/signature status
+
+Use Runtime Lineage as the approval unit when deciding whether a build may release.
+
+## Dockerfile And BuildKit Rules
+
+Use one multi-stage Dockerfile built by BuildKit. Do not split Docker image layers into many Argo tasks.
+
+Prefer these stages:
+
+```text
+base -> dependencies -> test -> release
+```
+
+Keep cache-sensitive order:
+
+```text
+Runtime Image -> Lock File -> Wheelhouse -> Dependency Install -> Application Source -> Runtime Configuration
+```
+
+Rules:
+
+- Copy lock files before source files.
+- Copy wheelhouse before dependency install.
+- Keep tests and build tools out of the final release image.
+- Keep model artifacts out of the image by default.
+- Use `USER` with a non-root UID in final images.
+- Ban `latest` as the only deployable tag.
+- Prefer digest-pinned `FROM` images.
+- Use `.dockerignore` to exclude `.git`, virtualenvs, caches, notebooks, datasets, models, test outputs, and local artifacts.
+
+## Nexus Wheelhouse Flow
+
+In closed-network builds, separate package preparation from image building:
+
+```text
+validate spec -> download wheels from Nexus -> verify lock/hash -> BuildKit offline install
+```
+
+Use Nexus only in the dependency preparation step. BuildKit should install offline from wheelhouse:
+
+```bash
+python -m pip install --no-index --find-links=/build/wheelhouse \
+  --only-binary=:all: --prefix=/opt/python-dependencies \
+  -r /build/requirements.lock
+```
+
+Check:
+
+- all required wheels exist in Nexus
+- source distributions are not used in release paths unless explicitly approved
+- wheel count and total bytes are reported
+- Nexus download time is measured
+- dependency cache hit/miss is explained
+- Nexus, BuildKit, and Harbor concurrency limits are independent
+
+For uv projects, avoid repeated `uv run` sync in short tasks. Prepare dependencies once with `uv sync --frozen` or an equivalent wheel preparation step, then use `uv run --no-sync` only after correctness is established.
+
+## Builder Pipeline
+
+Prefer this flow:
+
+```text
+validate-build-spec
+  -> verify-runtime-contract
+  -> resolve-parent-digest
+  -> prepare-wheelhouse-from-nexus
+  -> render-dockerfile
+  -> generate-bake-targets
+  -> build-dependency-or-test-target
+  -> run-unit-smoke-security-gates
+  -> build-release-image
+  -> push-release-image-to-harbor
+  -> resolve-final-image-digest
+  -> generate-sbom-provenance
+  -> sign-and-attest
+  -> update-runtime-lineage-catalog
+  -> publish-build-report
+```
+
+Quality gates must pass before release push, unless the organization uses a quarantine registry. If quarantine is used, promote only after gates pass.
+
+Sign only immutable references such as `repository@sha256:...`.
+
+## Build Report
+
+Every successful or failed build should produce a machine-readable report.
+
+Include:
+
+- workflow name, workflow UID, status, timestamp
+- builder spec hash
+- source repository and commit
+- image category and runtime contract
+- runtime lineage id/version
+- parent image digest and final image digest
+- Python ABI, Python version, CUDA/framework versions
+- lock file name and lock hash
+- Nexus repository
+- wheel count, total bytes, download seconds, average throughput
+- dependency cache hit/miss
+- BuildKit cache hit/miss when available
+- build seconds and Harbor push seconds
+- SBOM/provenance/signature status
+- non-root/latest/digest policy result
+- failure step and reason
+
+Use the report to explain whether the bottleneck is Nexus download, dependency install, BuildKit build, Harbor push, or runtime rollout.
+
+## Review Checklist
+
+When reviewing or generating an image builder, check:
+
+- A declarative builder spec exists and is validated before rendering.
+- Runtime Contract is explicit and digest-based.
+- Same-environment comparison uses ABI/framework/Python/platform/lock/spec, not image name alone.
+- Training, serving, and batch images are separated.
+- Dockerfile stages are `base`, `dependencies`, `test`, and `release` or an equivalent clear structure.
+- Dependency layers are isolated from application source layers.
+- Nexus wheelhouse is prepared once and BuildKit installs offline.
+- Release image excludes tests, compilers, wheelhouse, caches, models, and credentials.
+- Runtime Lineage and Image Catalog record parent and final digests.
+- BuildKit registry cache is separate from final Harbor image repositories.
+- Only release images are pushed to deployable repositories after gates pass.
+- Digest, lock hash, non-root user, latest tag ban, report, SBOM/provenance/signature rules are enforced.
+
+## Failure Triage
+
+Classify failures before changing code:
+
+- Nexus slow: check wheel-only availability, download concurrency, wheelhouse reuse, and response timing.
+- uv slow: check repeated sync, stale lock, cache path, workspace discovery, and whether `--no-sync` is safe.
+- BuildKit slow: check dependency layer invalidation, registry cache import/export, builder CPU/memory, and `.dockerignore`.
+- Harbor push slow: check image size, push concurrency, release/cache repository split, and network throughput.
+- Reproducibility failure: compare runtime contract, parent digest, lock hash, Dockerfile hash, builder spec hash, source commit, and build args.
+- Runtime mismatch: compare Python ABI, CUDA/framework versions, platform, and Runtime Lineage.
+- Security failure: check non-root user, latest tag, digest pinning, SBOM/provenance/signature, and credential handling.
