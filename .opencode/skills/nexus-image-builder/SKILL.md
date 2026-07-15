@@ -1,6 +1,6 @@
 ---
 name: nexus-image-builder
-description: Use when creating, reviewing, or debugging an AI/ML container image builder for OpenCode in a closed network, with Nexus wheel-only dependencies, BuildKit, Harbor, Argo Workflows, KServe serving images, Runtime Contract, runtime version matrices, Python/MLflow/Oracle checks, project indexing, bucket artifact performance, Docker size optimization, Build Reports, and failure triage.
+description: Use when creating, reviewing, or debugging a PyTorch-focused AI/ML container image builder for OpenCode in a closed network, with Nexus wheel-only dependencies, BuildKit, Harbor, Argo Workflows, KServe serving images, Runtime Contract, runtime version matrices, Python/PyTorch/MLflow/Oracle checks, project indexing, bucket artifact performance, Docker size optimization, Build Reports, and failure triage.
 ---
 
 # Nexus AI/ML Image Builder
@@ -29,7 +29,7 @@ Validate:
 - image category and runtime variant id
 - Runtime Contract id, version, parent image reference, and digest
 - Python version and ABI
-- framework versions: CUDA, PyTorch/TensorFlow, FastAPI, MLflow when used
+- framework versions: PyTorch, torchvision, torchaudio, CUDA/CPU runtime, FastAPI, MLflow when used
 - Oracle client/Instant Client and Python driver when Oracle is used
 - lock file path and lock hash
 - Nexus repository, wheel-only policy, and wheelhouse manifest
@@ -64,14 +64,18 @@ index:
   exclude: [".opencode", ".git", ".venv", "datasets", "models/raw"]
 
 runtime_matrix:
-  - variant_id: py310-cpu-mlflow214-oracle21-serving
+  - variant_id: py310-cu121-torch24-mlflow214-oracle21-serving
     image_category: serving
     platform: linux/amd64
     python: "3.10.14"
     python_abi: cp310
-    runtime_contract: serving-py310-cpu@sha256:...
-    parent_image: harbor.example/base/python@sha256:...
+    runtime_contract: serving-py310-cu121@sha256:...
+    parent_image: harbor.example/base/pytorch-runtime@sha256:...
     framework:
+      torch: "2.4.0"              # User-provided PyTorch version is authoritative
+      torchvision: "0.19.0"       # Must match torch/CUDA compatibility policy
+      torchaudio: "2.4.0"
+      cuda: "12.1"                # null for CPU-only variants
       fastapi: "0.115.0"
       mlflow: "2.14.3"            # User-provided version is authoritative
     oracle:
@@ -98,13 +102,14 @@ report:
 
 ## Runtime Contract And Matrix
 
-Use one matrix row per supported combination of Python, ABI, platform, CUDA, framework, MLflow, Oracle, and image category.
+Use one matrix row per supported combination of Python, ABI, platform, PyTorch, CUDA/CPU runtime, MLflow, Oracle, and image category.
 
 For each row:
 
 - produce a separate image digest and Build Report entry
 - use a separate lock hash, wheelhouse key, and BuildKit cache scope
 - validate Nexus wheels against Python ABI and platform
+- validate PyTorch, torchvision, torchaudio, CUDA runtime, and parent image compatibility
 - validate Oracle client libraries and Python driver compatibility when declared
 - compare environments by variant id, ABI, platform, framework versions, lock hash, parent digest, and spec hash
 - reject undeclared cross-product combinations
@@ -118,6 +123,15 @@ Python:
 - Require exact Python version and ABI, such as `3.10.14` and `cp310`.
 - Do not reuse dependency layers across different ABI values.
 - Record requested and installed Python versions in Runtime Contract and Build Report.
+
+PyTorch:
+
+- Treat `torch`, `torchvision`, `torchaudio`, Python ABI, platform, and CUDA/CPU runtime as one compatibility set.
+- Use the user-provided versions from the spec or lock file; do not auto-upgrade to latest.
+- Keep CPU and GPU variants separate; do not ship CUDA libraries in CPU-only serving images.
+- Prefer CUDA runtime bases for serving; keep CUDA devel/toolkit images for training/build stages only.
+- Verify PyTorch wheels are mirrored in Nexus for the target ABI/platform/runtime before BuildKit starts.
+- Run a smoke check that imports torch and verifies `torch.__version__`, CUDA availability expectation, and model load path.
 
 MLflow:
 
@@ -262,6 +276,7 @@ Every build should produce JSON with:
 - runtime variant id, matrix row hash, image category, Runtime Contract
 - parent digest, final digest, lineage id/version
 - Python ABI/version, CUDA/framework versions, MLflow version, Oracle client/driver versions
+- PyTorch, torchvision, torchaudio, and CPU/CUDA runtime expectation
 - lock file, lock hash, Nexus repository, wheel count/bytes/download seconds
 - uv sync seconds, uv run seconds, offline/index mode
 - bucket source, checksum, bytes, object count, download seconds, cache hit/miss
@@ -288,6 +303,7 @@ Check:
 - training, serving, and batch images are separated
 - release image excludes tests, compilers, wheelhouse, caches, credentials, and raw unused artifacts
 - MLflow, Oracle, and Python versions are pinned, validated, and reported
+- PyTorch compatibility set is pinned, resolved from Nexus, smoke-tested, and reported
 - BuildKit cache repos are separate from Harbor release repos
 - SBOM/provenance/signature, non-root, latest ban, digest pinning, and report rules are enforced
 
@@ -302,6 +318,6 @@ Check:
 - Harbor push slow: check image size, push concurrency, release/cache repo split, and network throughput.
 - Image too large: check category separation, CUDA devel base, build tools, wheelhouse/cache leakage, `.dockerignore`, model layer size, and unused dependencies.
 - Model rollout slow: check model size, image pull time, node cache reuse, rollout strategy, and model-in-image tradeoff.
-- Runtime mismatch: compare ABI, Python, CUDA/framework, MLflow, Oracle, platform, Runtime Contract, and Runtime Lineage.
+- Runtime mismatch: compare ABI, Python, PyTorch, CUDA/CPU runtime, MLflow, Oracle, platform, Runtime Contract, and Runtime Lineage.
 - Reproducibility failure: compare parent digest, lock hash, Dockerfile hash, spec hash, source commit, build args, and final digest.
 - Security failure: check non-root user, latest tags, digest pinning, SBOM/provenance/signature, and credential handling.
