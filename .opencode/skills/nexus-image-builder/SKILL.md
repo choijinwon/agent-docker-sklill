@@ -1,6 +1,6 @@
 ---
 name: nexus-image-builder
-description: Use when creating, reviewing, or debugging an AI/ML container image builder that uses Nexus PyPI wheel-only dependencies, BuildKit, Harbor, Runtime Contract, Runtime Lineage, declarative builder specs, dependency caching, Docker image size optimization, digest-based reproducibility, image build reports, and training/serving/batch image separation.
+description: Use when creating, reviewing, or debugging an AI/ML container image builder that uses Nexus PyPI wheel-only dependencies, BuildKit, Harbor, Runtime Contract, runtime version matrices, Oracle client version checks, Runtime Lineage, declarative builder specs, dependency caching, Docker image size optimization, digest-based reproducibility, image build reports, and training/serving/batch image separation.
 ---
 
 # Nexus AI/ML Image Builder
@@ -21,11 +21,13 @@ Validate at least:
 
 - source repository, branch or commit, repository name
 - image category: `training`, `serving`, `batch`, or shared runtime/base
+- runtime matrix or single runtime variant id when multiple Python/framework versions are supported
 - runtime contract id and version
 - runtime image reference and digest
 - Python ABI and version
 - CUDA/framework/runtime versions when applicable
 - MLflow version when MLflow is used; treat the user-provided spec version as authoritative
+- Oracle client or Instant Client version when Oracle connectivity is used
 - dependency lock file and lock hash
 - Nexus PyPI repository and wheel-only policy
 - target platform and architecture
@@ -34,7 +36,7 @@ Validate at least:
 - security policy: non-root, digest pinning, latest tag ban, SBOM/provenance/signature requirements
 - report output path and notification destination when used
 
-Fail early when any required digest, lock hash, runtime contract, or image category is missing.
+Fail early when any required digest, lock hash, runtime contract, runtime variant id, or image category is missing.
 
 ## 9 Requirements
 
@@ -76,6 +78,7 @@ Include:
 - Python ABI and exact Python version
 - CUDA, cuDNN, NCCL, PyTorch/TensorFlow versions when used
 - MLflow version when the image logs, serves, loads, or registers MLflow models
+- Oracle client/Instant Client version, driver package, and required runtime libraries when Oracle is used
 - common runtime packages
 - expected user id and filesystem permissions
 - allowed package sources
@@ -83,6 +86,39 @@ Include:
 - health check and entrypoint conventions
 
 The builder must reject or flag builds that mix incompatible Python ABI, CUDA, framework, or parent image digest.
+
+## Runtime Matrix
+
+When a project supports multiple Python, Oracle client, CUDA, framework, or MLflow versions, model them as explicit runtime variants. Do not build one image that tries to support every combination.
+
+Use one matrix row per supported combination:
+
+```json
+{
+  "variant_id": "py310-cpu-mlflow214-serving",
+  "image_category": "serving",
+  "python": "3.10.14",
+  "python_abi": "cp310",
+  "platform": "linux/amd64",
+  "cuda": null,
+  "framework": {"fastapi": "0.115.0", "mlflow": "2.14.3"},
+  "oracle": {"client": "21.13", "driver": "oracledb==2.4.1"},
+  "runtime_contract": "serving-py310-cpu@sha256:...",
+  "lock_file": "locks/serving-py310.lock",
+  "nexus_wheelhouse_key": "serving/cp310/linux-amd64/<lock_hash>"
+}
+```
+
+For each matrix row:
+
+- build and report a separate image digest
+- use a separate lock hash, wheelhouse key, and BuildKit cache scope
+- validate Nexus wheels against that Python ABI and platform
+- validate Oracle client libraries and Python Oracle driver compatibility when Oracle is declared
+- compare environments by `variant_id`, ABI, platform, framework versions, lock hash, and parent digest
+- allow only declared combinations; reject accidental cross-product expansion
+
+For Argo, expand the matrix into parallel build items only after spec validation. Limit concurrency per Nexus, BuildKit, and Harbor separately so a large matrix does not overload shared infrastructure.
 
 ## MLflow Version Policy
 
@@ -105,6 +141,20 @@ Validate:
 
 Fail or require explicit approval when the lock file upgrades/downgrades MLflow, when Nexus is missing wheels, or when a serving image includes MLflow only for training-time convenience.
 
+## Oracle Version Policy
+
+Do not infer or auto-upgrade Oracle versions. Use the Oracle client or Instant Client version supplied by the user in the builder spec.
+
+Require Oracle checks only when the image connects to Oracle:
+
+- record Oracle client/Instant Client version separately from Python package driver versions
+- pin Python driver packages such as `oracledb` or `cx_Oracle` in the lock file
+- verify required shared libraries are present in the final image
+- validate `LD_LIBRARY_PATH` or equivalent runtime path only when the driver requires it
+- record Oracle client version, driver version, and connectivity mode in Runtime Contract, Runtime Lineage, and Build Report
+
+Fail or require approval when the Oracle client version is missing, when Python driver and client mode are incompatible, or when the final image accidentally drops required shared libraries during size optimization.
+
 ## Runtime Lineage
 
 Track images through this chain:
@@ -116,6 +166,7 @@ Trusted Base -> Runtime -> Framework -> Application Base -> Application Release
 Record at least:
 
 - lineage id and version
+- runtime variant id when matrix builds are used
 - image role/category
 - project or service owner
 - parent image digest
@@ -256,6 +307,7 @@ Prefer this flow:
 
 ```text
 validate-build-spec
+  -> expand-runtime-matrix
   -> verify-runtime-contract
   -> resolve-parent-digest
   -> prepare-wheelhouse-from-nexus
@@ -285,11 +337,13 @@ Include:
 - workflow name, workflow UID, status, timestamp
 - builder spec hash
 - source repository and commit
+- runtime variant id and matrix row hash when matrix builds are used
 - image category and runtime contract
 - runtime lineage id/version
 - parent image digest and final image digest
 - Python ABI, Python version, CUDA/framework versions
 - requested and installed MLflow versions when MLflow is used
+- requested and installed Oracle client and Python Oracle driver versions when Oracle is used
 - lock file name and lock hash
 - Nexus repository
 - wheel count, total bytes, download seconds, average throughput
@@ -310,6 +364,7 @@ When reviewing or generating an image builder, check:
 
 - A declarative builder spec exists and is validated before rendering.
 - Runtime Contract is explicit and digest-based.
+- Multiple Python/framework/runtime versions are represented as explicit matrix variants, not hidden conditionals inside one image.
 - Same-environment comparison uses ABI/framework/Python/platform/lock/spec, not image name alone.
 - Training, serving, and batch images are separated.
 - Dockerfile stages are `base`, `dependencies`, `test`, and `release` or an equivalent clear structure.
@@ -317,6 +372,7 @@ When reviewing or generating an image builder, check:
 - Nexus wheelhouse is prepared once and BuildKit installs offline.
 - Release image excludes tests, compilers, wheelhouse, caches, and credentials.
 - MLflow is included only when needed, pinned to the user-provided version, resolved from Nexus wheels, and recorded in the report.
+- Oracle client and Python Oracle driver versions are pinned, validated in the final image, and recorded when Oracle is used.
 - Release image size is measured; large layers and model contribution are reported.
 - Models are either externalized through supported infrastructure or intentionally packaged with digest/checksum/report metadata.
 - Runtime Lineage and Image Catalog record parent and final digests.
@@ -336,5 +392,7 @@ Classify failures before changing code:
 - Model image rollout slow: check model size, image pull time, node cache reuse, rollout strategy, and whether model-in-image is still the right tradeoff.
 - Reproducibility failure: compare runtime contract, parent digest, lock hash, Dockerfile hash, builder spec hash, source commit, and build args.
 - Runtime mismatch: compare Python ABI, CUDA/framework versions, platform, and Runtime Lineage.
+- Matrix mismatch: compare variant id, matrix row hash, lock file, parent digest, cache scope, and intended image category.
 - MLflow mismatch: compare builder spec, lock file, Nexus wheel version, installed package metadata, and runtime category need.
+- Oracle mismatch: compare builder spec, Oracle client libraries, Python driver version, runtime library path, final image contents, and target database compatibility.
 - Security failure: check non-root user, latest tag, digest pinning, SBOM/provenance/signature, and credential handling.
