@@ -352,16 +352,28 @@ Performance defaults:
 - set pip/uv to offline or internal-index mode; do not allow fallback to the internet
 - use a persistent uv cache and wheelhouse keyed by `python_abi`, platform, lock hash, and runtime variant
 - use `uv run --no-sync` for short commands after `uv sync --frozen` has succeeded
+- fetch bucket artifacts by manifest/checksum, not recursive list operations
+- cache bucket downloads by object URI, version/id, size, checksum, and runtime variant
 - keep `UV_LINK_MODE=copy` or another environment-approved mode when filesystem links are slow or unsupported
 - keep Argo workspaces, BuildKit cache, and wheelhouse storage on fast internal storage
 - cap matrix concurrency to protect Nexus and Harbor; increase BuildKit concurrency only after cache hit rate is healthy
 - separate BuildKit cache images from release images, and prune only by policy, not on every run
 - prefer prebuilt runtime/framework images over rebuilding heavy dependency layers per project
 
+For slow bucket/model artifact reads:
+
+- avoid listing large prefixes during every build; read a small manifest file first
+- use `HEAD` or metadata checks before downloading large objects
+- download only changed objects; skip when checksum and size match the local or shared cache
+- use bounded multipart/parallel download; cap concurrency so the bucket backend is not saturated
+- stage shared artifacts once per workflow and reuse them across matrix rows
+- keep raw model binaries out of the project index; index only model metadata and checksums
+
 Measure and report:
 
 - preflight seconds
 - project index refresh seconds and changed input count
+- bucket list/head/download seconds, bytes, object count, and cache hit/miss
 - Nexus wheel lookup/download seconds
 - uv sync seconds and `uv run` seconds
 - BuildKit cache import/export seconds and cache hit rate
@@ -369,7 +381,7 @@ Measure and report:
 - Harbor push seconds
 - Argo queue/wait seconds per step
 
-If a closed-network build is slow, first identify whether time is spent waiting for blocked external URLs, missing mirrors, full project scans, cold wheelhouse, repeated uv sync, BuildKit cache miss, image pull/push, or Argo scheduling.
+If a closed-network build is slow, first identify whether time is spent waiting for blocked external URLs, missing mirrors, full project scans, bucket artifact reads, cold wheelhouse, repeated uv sync, BuildKit cache miss, image pull/push, or Argo scheduling.
 
 ## Builder Pipeline
 
@@ -411,6 +423,7 @@ Include:
 - source repository and commit
 - network mode and closed-network preflight result
 - project index hash, refresh seconds, and changed input count when indexing is used
+- bucket/object artifact source, checksum, bytes, download seconds, and cache hit/miss when used
 - runtime variant id and matrix row hash when matrix builds are used
 - image category and runtime contract
 - runtime lineage id/version
@@ -442,6 +455,7 @@ When reviewing or generating an image builder, check:
 - A declarative builder spec exists and is validated before rendering.
 - Closed-network mode has explicit internal mirrors, offline behavior, and a preflight gate.
 - OpenCode uses a project build index instead of repeated full-repository scans.
+- Bucket artifacts use manifest/checksum caching instead of repeated large prefix scans.
 - Runtime Contract is explicit and digest-based.
 - Multiple Python/framework/runtime versions are represented as explicit matrix variants, not hidden conditionals inside one image.
 - Same-environment comparison uses ABI/framework/Python/platform/lock/spec, not image name alone.
@@ -467,6 +481,7 @@ Classify failures before changing code:
 - Nexus slow: check wheel-only availability, download concurrency, wheelhouse reuse, and response timing.
 - OpenCode indexing slow: check index scope, checksum strategy, ignored directories such as `.opencode` and `.git`, large model/data files, file watcher availability, and changed input count.
 - Closed-network slow: check blocked external URL attempts, missing internal mirrors, DNS/proxy/TLS delays, full project scans, cold wheelhouse, cold BuildKit cache, and Argo queue time.
+- Bucket slow: check prefix listing, missing manifest, object count, object size, checksum cache, multipart settings, concurrency, and workflow artifact reuse.
 - uv slow: check repeated sync, stale lock, cache path, workspace discovery, offline index configuration, filesystem link mode, and whether `--no-sync` is safe.
 - BuildKit slow: check dependency layer invalidation, registry cache import/export, builder CPU/memory, and `.dockerignore`.
 - Harbor push slow: check image size, push concurrency, release/cache repository split, and network throughput.
