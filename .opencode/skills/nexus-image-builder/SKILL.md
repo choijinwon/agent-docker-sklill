@@ -1,6 +1,6 @@
 ---
 name: nexus-image-builder
-description: Use when creating, reviewing, or debugging an AI/ML container image builder that uses Nexus PyPI wheel-only dependencies, BuildKit, Harbor, Runtime Contract, Runtime Lineage, declarative builder specs, dependency caching, digest-based reproducibility, image build reports, and training/serving/batch image separation.
+description: Use when creating, reviewing, or debugging an AI/ML container image builder that uses Nexus PyPI wheel-only dependencies, BuildKit, Harbor, Runtime Contract, Runtime Lineage, declarative builder specs, dependency caching, Docker image size optimization, digest-based reproducibility, image build reports, and training/serving/batch image separation.
 ---
 
 # Nexus AI/ML Image Builder
@@ -134,6 +134,45 @@ Rules:
 - Prefer digest-pinned `FROM` images.
 - Use `.dockerignore` to exclude `.git`, virtualenvs, caches, notebooks, datasets, models, test outputs, and local artifacts.
 
+## Image Size Optimization
+
+Optimize release image size without breaking reproducibility, cache reuse, or startup reliability.
+
+Use this priority order:
+
+1. Separate `training`, `serving`, and `batch` images so serving images do not include training/debug tools.
+2. Use multi-stage builds so compilers, build tools, wheelhouse, tests, and scan tools stay out of release images.
+3. Use slim/runtime base images for release; avoid CUDA `devel` images in serving releases.
+4. Keep dependency, application, and model layers separate so model changes do not reinstall Python packages.
+5. Remove package manager caches in the same layer that creates them.
+6. Exclude large or volatile files through `.dockerignore`.
+7. Measure final image size and largest layers before calling the build optimized.
+
+Release images must not contain:
+
+- `tests`, notebooks, training-only scripts, or local fixtures
+- compilers, headers, `build-essential`, Git, curl/wget unless needed at runtime
+- wheelhouse, pip/uv cache, apt cache, BuildKit metadata
+- `.git`, `.venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`
+- datasets, temporary outputs, profiling dumps, and unused model variants
+- credentials, config with secrets, or registry/package tokens
+
+For Python:
+
+- Prefer wheel-only installs from Nexus.
+- Use `--no-cache-dir` for pip when not using a BuildKit cache mount.
+- Prefer installing into a deterministic prefix such as `/opt/python-dependencies`.
+- Remove `.pyc` and test data only when the runtime does not need them.
+
+For model-in-image:
+
+- Put model files in a late layer or `release-with-model` target.
+- Keep `release-without-model` buildable for test/scan comparison.
+- Report model size separately from application/runtime size.
+- Flag rollout risk when model size dominates the image.
+
+Do not chase tiny images by removing files needed for observability, health checks, CA certificates, timezone/locale support, or runtime diagnostics required by operations.
+
 ## Model Packaging Without PVC/NAS
 
 If PVC/NAS is unavailable, prefer one of these options:
@@ -232,6 +271,7 @@ Include:
 - wheel count, total bytes, download seconds, average throughput
 - dependency cache hit/miss
 - model packaging mode, model name/version/checksum/size when present
+- final image size, release-without-model size when available, and largest layer contributors
 - BuildKit cache hit/miss when available
 - build seconds and Harbor push seconds
 - SBOM/provenance/signature status
@@ -252,6 +292,7 @@ When reviewing or generating an image builder, check:
 - Dependency layers are isolated from application source layers.
 - Nexus wheelhouse is prepared once and BuildKit installs offline.
 - Release image excludes tests, compilers, wheelhouse, caches, and credentials.
+- Release image size is measured; large layers and model contribution are reported.
 - Models are either externalized through supported infrastructure or intentionally packaged with digest/checksum/report metadata.
 - Runtime Lineage and Image Catalog record parent and final digests.
 - BuildKit registry cache is separate from final Harbor image repositories.
@@ -266,6 +307,7 @@ Classify failures before changing code:
 - uv slow: check repeated sync, stale lock, cache path, workspace discovery, and whether `--no-sync` is safe.
 - BuildKit slow: check dependency layer invalidation, registry cache import/export, builder CPU/memory, and `.dockerignore`.
 - Harbor push slow: check image size, push concurrency, release/cache repository split, and network throughput.
+- Image too large: check image category separation, CUDA devel base usage, build tools in release, wheelhouse/cache leakage, `.dockerignore`, model layer size, and unused dependencies.
 - Model image rollout slow: check model size, image pull time, node cache reuse, rollout strategy, and whether model-in-image is still the right tradeoff.
 - Reproducibility failure: compare runtime contract, parent digest, lock hash, Dockerfile hash, builder spec hash, source commit, and build args.
 - Runtime mismatch: compare Python ABI, CUDA/framework versions, platform, and Runtime Lineage.
