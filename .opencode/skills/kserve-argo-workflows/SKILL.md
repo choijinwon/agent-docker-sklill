@@ -1,6 +1,6 @@
 ---
 name: kserve-argo-workflows
-description: Use when creating, reviewing, or debugging KServe 0.15 model serving projects that use Argo Workflows, including Kubernetes YAML, Python model server code, Docker images, BuildKit and Buildx Bake pipelines, Docker build speed and layer cache checks, uv run performance, package version checks, image digest/catalog checks, RBAC, storageUri/modelFormat fields, readiness, rollout updates, and inference smoke tests.
+description: Use when creating, reviewing, or debugging KServe 0.15 model serving projects that use Argo Workflows, including Kubernetes YAML, Python model server code, Docker images, BuildKit and Buildx Bake pipelines, Nexus PyPI wheelhouse optimization, Docker build speed and layer cache checks, uv run performance, package version checks, image digest/catalog checks, RBAC, storageUri/modelFormat fields, readiness, rollout updates, and inference smoke tests.
 ---
 
 # KServe 0.15 With Argo Workflows
@@ -90,6 +90,20 @@ build image -> push image -> apply InferenceService -> wait Ready -> smoke test
 
 When the user asks for only skill changes, encode this workflow as guidance in `SKILL.md`; do not create separate workflow YAML unless explicitly requested.
 
+## Build Spec Contract
+
+When creating or reviewing an image-build workflow, require an explicit build spec before rendering Dockerfile, Bake, or Argo templates. Validate at least:
+
+- source: repository URL, branch or commit, repository name
+- runtime: lineage id/version, Python version, CUDA/framework versions when used
+- dependencies: lock file name, lock hash, Nexus PyPI repository, wheel-only flag
+- image: repository, immutable tag, cache repository, target platform
+- build: target name, build args, Dockerfile template hash, Bake definition hash
+- security: parent image digest, signature/SBOM/provenance requirements
+- reporting: workflow name/UID, output path, notification URL if used
+
+Fail early when required fields are missing, image tags are mutable-only, parent digest is absent, or lock hash does not match the declared lock file.
+
 ## Argo BuildKit Image Pipeline
 
 When the workflow builds images, prefer a DAG that separates preparation, quality gates, supply-chain metadata, release push, and catalog registration:
@@ -128,7 +142,7 @@ For Buildx Bake:
 - Generate targets from the build spec and keep `docker-bake.hcl` hashable.
 - Use registry cache references separate from final images, for example `harbor.example.com/build-cache/model:buildcache`.
 - Prefer `cache-to=type=registry,ref=...,mode=max` so multi-stage intermediate layers can be reused.
-- Limit concurrency for shared resources such as internal PyPI, BuildKit, and Harbor; more parallelism can increase failure rate.
+- Limit concurrency for shared resources such as Nexus PyPI, BuildKit, and Harbor; more parallelism can increase failure rate.
 
 For BuildKit execution in Kubernetes:
 
@@ -136,6 +150,44 @@ For BuildKit execution in Kubernetes:
 - Keep Git clone, template render, wheel download, and BuildKit execution as separate concerns.
 - If the BuildKit client image lacks Git or package tools, prepare files in an earlier task and pass them through PVC/artifacts.
 - Use BuildKit secrets for credentials. Do not pass registry, Git, PyPI, or cosign secrets through Dockerfile `ARG` or `COPY`.
+
+## Nexus Wheelhouse Optimization
+
+For closed-network Python builds, treat Nexus as the package source and keep BuildKit offline:
+
+- Resolve/download wheels in a dedicated Argo task that can access Nexus.
+- Store wheels on workflow PVC or artifact storage as `wheelhouse`.
+- BuildKit must install from `wheelhouse` with `--no-index --find-links`.
+- Prefer wheel-only installs for serving images; avoid source builds in release paths.
+- Record wheel count, total bytes, download seconds, and average download speed.
+- Limit Nexus download concurrency separately from BuildKit and Harbor concurrency.
+- Do not run `uv run` in many short Argo steps if each step re-syncs dependencies.
+
+Use this install shape inside Dockerfile templates when a wheelhouse is prepared:
+
+```bash
+python -m pip install --no-index --find-links=/build/wheelhouse \
+  --only-binary=:all: --prefix=/opt/python-dependencies \
+  -r /build/requirements.lock
+```
+
+For uv projects, prefer an explicit prep step such as `uv sync --frozen` or wheel export/download before BuildKit. Use `uv run --no-sync` only after the environment or wheelhouse is already correct.
+
+## Dockerfile Stage Standard
+
+Prefer one multi-stage Dockerfile built by BuildKit instead of separate Argo tasks for each image layer. Use stage names consistently:
+
+```text
+base -> dependencies -> test -> release
+```
+
+Keep the cache-friendly order:
+
+```text
+Runtime Image -> Lock File -> Wheelhouse -> Dependency Install -> Application Source -> Runtime Configuration
+```
+
+Final release images must not contain tests, wheelhouse, compilers, build tools, pip/uv download caches, BuildKit files, Git metadata, or credentials.
 
 ## Environment Fingerprint And Image Lineage
 
@@ -181,6 +233,21 @@ Track Runtime Lineage in image labels or catalog metadata:
 
 Only allow approved Runtime Lineage for release builds when a catalog exists.
 
+## Build Report Contract
+
+When workflows build images, emit a machine-readable report as an Argo artifact and output parameter. Include:
+
+- workflow name, workflow UID, namespace, status, timestamp
+- repository name, source repository, source commit
+- image reference, image digest, parent image digest, runtime lineage
+- lock file name, lock hash, build spec hash, Dockerfile hash, Bake hash
+- wheel count, wheel total bytes, wheel download seconds, average download rate
+- Nexus repository, wheel-only flag, build seconds, push seconds
+- security scan result, SBOM digest, provenance digest, signature verified
+- failure step and failure reason when the workflow fails
+
+Use the report to explain whether time was spent in Nexus download, dependency install, BuildKit build, security scan, Harbor push, or KServe readiness.
+
 ## Workflow Schema Repair Rules
 
 When correcting user-provided Argo YAML or JSON, fix common malformed fields before reasoning about behavior:
@@ -198,6 +265,19 @@ severAccountName -> serviceAccountName
 Each template must contain one valid template body such as `container`, `script`, `steps`, `dag`, `resource`, or `suspend`. A template with only `name` is not executable.
 
 When users ask for both YAML and JSON, ensure both formats describe the same `WorkflowTemplate`: same task names, templates, parameters, dependencies, volumes, secrets, and output paths.
+
+## Failure Triage Matrix
+
+When debugging, classify failures before changing manifests:
+
+- `uv run` slow: check repeated sync, stale `uv.lock`, missing cache, broad workspace discovery, and whether `--no-sync` is safe after sync.
+- Nexus slow: check wheelhouse reuse, wheel-only availability, package download concurrency, cache hit rate, and Nexus response timing.
+- BuildKit slow: check registry cache hit, lock file changes, `.dockerignore`, dependency layer invalidation, builder CPU/memory, and cache import/export.
+- Harbor push slow: check image size, release vs cache repository split, network throughput, and push concurrency.
+- `ImagePullBackOff`: check registry secret, digest/tag, namespace, pull policy, and Harbor permissions.
+- KServe `Ready=False`: check `InferenceService` status, predictor pod logs, Knative revision, storage initializer, and ingress status.
+- storage failure: check `storageUri`, service account, object-store secret, network policy, and model artifact path.
+- signature/catalog failure: check registry digest resolution, cosign key/identity, attestation target, and catalog write permissions.
 
 ## uv Run Performance Checks
 
@@ -227,6 +307,7 @@ Recommended patterns:
 - For CI where the lockfile must not change, prefer `uv run --locked <cmd>` or `uv run --frozen <cmd>` depending on whether lock freshness should be checked.
 - In Docker, copy `pyproject.toml` and `uv.lock` before source files, run dependency sync in a cacheable layer, then use `uv run --no-sync` for later build/test commands that should not re-sync.
 - In Argo steps, avoid installing or syncing dependencies in every short command container. Build dependencies into the image or add an explicit dependency-prep step with persistent cache only if the cluster supports it.
+- With Nexus-backed builds, separate dependency preparation from command execution: download/verify wheels once, then run tests and image builds against the prepared environment or wheelhouse.
 
 Example Docker shape with uv cache:
 
@@ -308,60 +389,16 @@ For KServe custom resources:
 
 ## Minimal Workflow Shape
 
-```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Workflow
-metadata:
-  generateName: deploy-kserve-
-spec:
-  serviceAccountName: kserve-deployer
-  entrypoint: deploy
-  arguments:
-    parameters:
-      - name: namespace
-        value: kserve-test
-      - name: model-name
-        value: sklearn-iris
-      - name: storage-uri
-        value: gs://kfserving-examples/models/sklearn/1.0/model
-  templates:
-    - name: deploy
-      steps:
-        - - name: apply-isvc
-            template: apply-inferenceservice
-        - - name: wait-ready
-            template: wait-inferenceservice
+For a deploy-only workflow, generate this shape:
 
-    - name: apply-inferenceservice
-      resource:
-        action: apply
-        manifest: |
-          apiVersion: serving.kserve.io/v1beta1
-          kind: InferenceService
-          metadata:
-            name: "{{workflow.parameters.model-name}}"
-            namespace: "{{workflow.parameters.namespace}}"
-          spec:
-            predictor:
-              model:
-                modelFormat:
-                  name: sklearn
-                storageUri: "{{workflow.parameters.storage-uri}}"
-
-    - name: wait-inferenceservice
-      container:
-        image: bitnami/kubectl:latest
-        command: [sh, -c]
-        args:
-          - |
-            kubectl wait inferenceservice "{{workflow.parameters.model-name}}" \
-              -n "{{workflow.parameters.namespace}}" \
-              --for=condition=Ready \
-              --timeout=10m
-            kubectl get inferenceservice "{{workflow.parameters.model-name}}" \
-              -n "{{workflow.parameters.namespace}}" \
-              -o wide
+```text
+arguments: namespace, model-name, image/storageUri, modelFormat
+steps: apply InferenceService -> wait Ready -> smoke test
+apply template: resource action=apply, apiVersion=serving.kserve.io/v1beta1
+wait template: kubectl wait inferenceservice <name> --for=condition=Ready
 ```
+
+Use a full BuildKit DAG only when the workflow also builds or signs images.
 
 ## RBAC Shape
 
@@ -416,10 +453,12 @@ When reviewing or generating manifests, check:
 - Dockerfile copies dependency files before source files so dependency layers are cacheable.
 - `.dockerignore` excludes large or volatile files that break cache or bloat the serving image.
 - BuildKit cache mounts or wheel caching are considered for slow dependency installs.
+- Nexus wheelhouse preparation is separated from BuildKit image building when the environment is closed-network or package download is slow.
 - `uv run` hot paths avoid unnecessary sync only after lockfile/environment correctness is established.
 - CI and Docker builds use `uv.lock`, `--locked`, `--frozen`, or `--no-sync` intentionally instead of accidentally re-resolving each command.
 - BuildKit pipelines keep release push after quality gates and cosign signing after registry digest resolution.
 - Image catalog records final image digest, parent digest, source commit, lock hash, Dockerfile hash, Bake hash, SBOM/provenance digests, and signature verification.
+- Build report exposes Nexus download, BuildKit build, Harbor push, and KServe readiness timings when available.
 - PVC/artifacts are used for workflow files and reports; Registry Cache is used for Docker layer reuse.
 
 ## Debugging Commands
