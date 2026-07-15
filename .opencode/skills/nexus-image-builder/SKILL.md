@@ -25,6 +25,7 @@ Validate at least:
 - runtime image reference and digest
 - Python ABI and version
 - CUDA/framework/runtime versions when applicable
+- MLflow version when MLflow is used; treat the user-provided spec version as authoritative
 - dependency lock file and lock hash
 - Nexus PyPI repository and wheel-only policy
 - target platform and architecture
@@ -74,6 +75,7 @@ Include:
 - operating system and architecture
 - Python ABI and exact Python version
 - CUDA, cuDNN, NCCL, PyTorch/TensorFlow versions when used
+- MLflow version when the image logs, serves, loads, or registers MLflow models
 - common runtime packages
 - expected user id and filesystem permissions
 - allowed package sources
@@ -81,6 +83,27 @@ Include:
 - health check and entrypoint conventions
 
 The builder must reject or flag builds that mix incompatible Python ABI, CUDA, framework, or parent image digest.
+
+## MLflow Version Policy
+
+Do not pin MLflow to the latest version by default. Use the version supplied by the user in the builder spec or lock file.
+
+Require MLflow version checks only when MLflow is part of the image contract:
+
+- `training`: include MLflow when experiment tracking, model registration, or artifact logging runs inside the image.
+- `serving`: include MLflow only when the serving runtime loads MLflow models or uses MLflow APIs at runtime.
+- `batch`: include MLflow only when batch jobs read/write MLflow models, registry metadata, or tracking data.
+- `framework`: allow MLflow as a shared framework package only if downstream images agree on the same version contract.
+
+Validate:
+
+- the user-provided MLflow version is exact, such as `mlflow==x.y.z`, not a floating range
+- the lock file resolves the same MLflow version as the builder spec
+- Nexus contains MLflow and all transitive wheels for the target Python version and platform
+- the wheelhouse install result matches the requested MLflow version
+- the Runtime Contract, Runtime Lineage, and Build Report record the requested and installed MLflow versions
+
+Fail or require explicit approval when the lock file upgrades/downgrades MLflow, when Nexus is missing wheels, or when a serving image includes MLflow only for training-time convenience.
 
 ## Runtime Lineage
 
@@ -266,6 +289,7 @@ Include:
 - runtime lineage id/version
 - parent image digest and final image digest
 - Python ABI, Python version, CUDA/framework versions
+- requested and installed MLflow versions when MLflow is used
 - lock file name and lock hash
 - Nexus repository
 - wheel count, total bytes, download seconds, average throughput
@@ -292,6 +316,7 @@ When reviewing or generating an image builder, check:
 - Dependency layers are isolated from application source layers.
 - Nexus wheelhouse is prepared once and BuildKit installs offline.
 - Release image excludes tests, compilers, wheelhouse, caches, and credentials.
+- MLflow is included only when needed, pinned to the user-provided version, resolved from Nexus wheels, and recorded in the report.
 - Release image size is measured; large layers and model contribution are reported.
 - Models are either externalized through supported infrastructure or intentionally packaged with digest/checksum/report metadata.
 - Runtime Lineage and Image Catalog record parent and final digests.
@@ -311,4 +336,5 @@ Classify failures before changing code:
 - Model image rollout slow: check model size, image pull time, node cache reuse, rollout strategy, and whether model-in-image is still the right tradeoff.
 - Reproducibility failure: compare runtime contract, parent digest, lock hash, Dockerfile hash, builder spec hash, source commit, and build args.
 - Runtime mismatch: compare Python ABI, CUDA/framework versions, platform, and Runtime Lineage.
+- MLflow mismatch: compare builder spec, lock file, Nexus wheel version, installed package metadata, and runtime category need.
 - Security failure: check non-root user, latest tag, digest pinning, SBOM/provenance/signature, and credential handling.
