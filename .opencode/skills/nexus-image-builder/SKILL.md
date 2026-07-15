@@ -1,387 +1,228 @@
 ---
 name: nexus-image-builder
-description: Use when creating, reviewing, or debugging an AI/ML container image builder that uses Nexus PyPI wheel-only dependencies, BuildKit, Harbor, OpenCode closed-network performance optimization, Runtime Contract, runtime version matrices, Oracle client version checks, Runtime Lineage, declarative builder specs, dependency caching, Docker image size optimization, digest-based reproducibility, image build reports, and training/serving/batch image separation.
+description: Use when creating, reviewing, or debugging an AI/ML container image builder for OpenCode in a closed network, with Nexus wheel-only dependencies, BuildKit, Harbor, Argo Workflows, KServe serving images, Runtime Contract, runtime version matrices, Python/MLflow/Oracle checks, project indexing, bucket artifact performance, Docker size optimization, Build Reports, and failure triage.
 ---
 
 # Nexus AI/ML Image Builder
 
-Use this skill for AI/ML image builder work where the goal is not just a faster Docker build, but a standard, auditable image-building system.
+Use this skill to design or review an auditable AI/ML image builder. Optimize the build system, not only Docker commands.
 
-## Core Position
+## Core Rules
 
-Treat Nexus as a wheel-only package source. Put standardization, cache reuse, security, reproducibility, and reporting in the Builder.
+- Treat Nexus as the only Python package source in closed-network builds.
+- Use BuildKit with registry cache; keep cache images separate from release images.
+- Build from a declarative spec, not hidden CI variables.
+- Use Runtime Contract and Runtime Lineage for approval and reproducibility.
+- Separate `training`, `serving`, `batch`, `runtime-base`, `framework`, `application-base`, and `release` images.
+- Do not assume PVC/NAS exists. Support object storage, OCI model artifacts, or model-in-image with strict reporting.
+- In OpenCode, index build inputs and changed files; do not scan the whole repository each run.
+- Exclude `.opencode` from application build indexing unless the task explicitly updates OpenCode skills or config.
 
-Do not assume download speed is the main bottleneck. First check image structure, dependency/application layer separation, BuildKit cache, Runtime Contract, and report/digest policy.
+## Required Spec Checks
 
-## Required Inputs
-
-Before generating Dockerfiles, Argo workflows, or builder code, require a declarative builder spec such as `image-builder.spec.json`.
-
-Validate at least:
-
-- source repository, branch or commit, repository name
-- network mode: closed-network, proxy-only, or internet-allowed
-- project index path and index hash when OpenCode indexing is used
-- image category: `training`, `serving`, `batch`, or shared runtime/base
-- runtime matrix or single runtime variant id when multiple Python/framework versions are supported
-- runtime contract id and version
-- runtime image reference and digest
-- Python ABI and version
-- CUDA/framework/runtime versions when applicable
-- MLflow version when MLflow is used; treat the user-provided spec version as authoritative
-- Oracle client or Instant Client version when Oracle connectivity is used
-- dependency lock file and lock hash
-- Nexus PyPI repository and wheel-only policy
-- target platform and architecture
-- BuildKit target: `dependencies`, `test`, or `release`
-- Harbor image repository, immutable tag, and cache repository
-- offline mirror endpoints and cache repositories for Nexus, Harbor, base images, BuildKit, uv, pip, OS packages, and model artifacts
-- security policy: non-root, digest pinning, latest tag ban, SBOM/provenance/signature requirements
-- report output path and notification destination when used
-
-Fail early when any required digest, lock hash, runtime contract, runtime variant id, or image category is missing.
-
-## 9 Requirements
-
-Implement and review against these requirements:
-
-1. Runtime Contract: common runtime environments must be fixed by digest.
-2. Same Environment Criteria: compare ABI, framework, Python, CUDA, platform, lock hash, and builder spec, not image name alone.
-3. Runtime Lineage: manage images by lineage, role, project, and parent digest chain.
-4. Training/Serving Separation: keep training, serving, and batch images separate; distinguish strict and optimized runtime patterns.
-5. Declarative Builder Spec: centralize layer, target, validation, and report rules.
-6. Multi-stage Target: separate dependency, test, and release targets; push only release targets after gates pass.
-7. Model Packaging Policy: externalize models only when the platform supports it; when PVC/NAS is unavailable, allow model-in-image with strict digest, size, cache, and release controls.
-8. Security and Reproducibility: require digest, lock hash, non-root user, latest tag ban, report, and policy checks.
-9. Wheel Repository: use Nexus wheel-only download and dependency cache reuse.
-
-## Image Categories
-
-Choose the image category before writing Dockerfile stages:
-
-- `training`: includes training libraries, notebooks only if required, distributed training tools, and heavier debug dependencies.
-- `serving`: minimal runtime for online inference; optimized startup, size, health check, and non-root runtime.
-- `batch`: offline inference or scheduled jobs; may include data connectors and batch orchestration tools.
-- `runtime-base`: organization-approved language/runtime base image.
-- `framework`: shared PyTorch/TensorFlow/MLflow/FastAPI framework image.
-- `application-base`: project or service-family shared dependencies without service-specific source.
-- `release`: final deployable application image.
-
-Do not combine training, serving, and batch requirements into one image unless the user explicitly chooses that tradeoff.
-
-## Runtime Contract
-
-Use Runtime Contract as the approved execution environment boundary.
-
-Include:
-
-- contract id and version
-- parent image repository and digest
-- operating system and architecture
-- Python ABI and exact Python version
-- CUDA, cuDNN, NCCL, PyTorch/TensorFlow versions when used
-- MLflow version when the image logs, serves, loads, or registers MLflow models
-- Oracle client/Instant Client version, driver package, and required runtime libraries when Oracle is used
-- common runtime packages
-- expected user id and filesystem permissions
-- allowed package sources
-- supported image categories
-- health check and entrypoint conventions
-
-The builder must reject or flag builds that mix incompatible Python ABI, CUDA, framework, or parent image digest.
-
-## Runtime Matrix
-
-When a project supports multiple Python, Oracle client, CUDA, framework, or MLflow versions, model them as explicit runtime variants. Do not build one image that tries to support every combination.
-
-Use one matrix row per supported combination:
-
-```json
-{
-  "variant_id": "py310-cpu-mlflow214-serving",
-  "image_category": "serving",
-  "python": "3.10.14",
-  "python_abi": "cp310",
-  "platform": "linux/amd64",
-  "cuda": null,
-  "framework": {"fastapi": "0.115.0", "mlflow": "2.14.3"},
-  "oracle": {"client": "21.13", "driver": "oracledb==2.4.1"},
-  "runtime_contract": "serving-py310-cpu@sha256:...",
-  "lock_file": "locks/serving-py310.lock",
-  "nexus_wheelhouse_key": "serving/cp310/linux-amd64/<lock_hash>"
-}
-```
-
-For each matrix row:
-
-- build and report a separate image digest
-- use a separate lock hash, wheelhouse key, and BuildKit cache scope
-- validate Nexus wheels against that Python ABI and platform
-- validate Oracle client libraries and Python Oracle driver compatibility when Oracle is declared
-- compare environments by `variant_id`, ABI, platform, framework versions, lock hash, and parent digest
-- allow only declared combinations; reject accidental cross-product expansion
-
-For Argo, expand the matrix into parallel build items only after spec validation. Limit concurrency per Nexus, BuildKit, and Harbor separately so a large matrix does not overload shared infrastructure.
-
-## MLflow Version Policy
-
-Do not pin MLflow to the latest version by default. Use the version supplied by the user in the builder spec or lock file.
-
-Require MLflow version checks only when MLflow is part of the image contract:
-
-- `training`: include MLflow when experiment tracking, model registration, or artifact logging runs inside the image.
-- `serving`: include MLflow only when the serving runtime loads MLflow models or uses MLflow APIs at runtime.
-- `batch`: include MLflow only when batch jobs read/write MLflow models, registry metadata, or tracking data.
-- `framework`: allow MLflow as a shared framework package only if downstream images agree on the same version contract.
+Before generating Dockerfiles, Argo workflows, or builder code, require a spec such as `image-builder.spec.json` or `image-builder.spec.yaml`.
 
 Validate:
 
-- the user-provided MLflow version is exact, such as `mlflow==x.y.z`, not a floating range
-- the lock file resolves the same MLflow version as the builder spec
-- Nexus contains MLflow and all transitive wheels for the target Python version and platform
-- the wheelhouse install result matches the requested MLflow version
-- the Runtime Contract, Runtime Lineage, and Build Report record the requested and installed MLflow versions
+- source repository, branch or commit, project owner
+- network mode: `closed-network`, `proxy-only`, or `internet-allowed`
+- image category and runtime variant id
+- Runtime Contract id, version, parent image reference, and digest
+- Python version and ABI
+- framework versions: CUDA, PyTorch/TensorFlow, FastAPI, MLflow when used
+- Oracle client/Instant Client and Python driver when Oracle is used
+- lock file path and lock hash
+- Nexus repository, wheel-only policy, and wheelhouse manifest
+- Harbor release repository and BuildKit cache repository
+- model/artifact source, checksum, and packaging mode
+- security policy: non-root, digest pinning, latest ban, SBOM/provenance/signature
+- report output path and notification target when used
 
-Fail or require explicit approval when the lock file upgrades/downgrades MLflow, when Nexus is missing wheels, or when a serving image includes MLflow only for training-time convenience.
+Fail early when any required digest, lock hash, runtime variant, Runtime Contract, or image category is missing.
 
-## Oracle Version Policy
+## Annotated Spec Skeleton
 
-Do not infer or auto-upgrade Oracle versions. Use the Oracle client or Instant Client version supplied by the user in the builder spec.
+Use this commented YAML as the authoring template. If the builder requires JSON, strip comments when rendering.
 
-Require Oracle checks only when the image connects to Oracle:
+```yaml
+project:
+  name: my-model-service          # Stable project/service id
+  owner: ml-platform              # Team responsible for release approval
+  source_ref: abc1234             # Git commit, not a floating branch
 
-- record Oracle client/Instant Client version separately from Python package driver versions
-- pin Python driver packages such as `oracledb` or `cx_Oracle` in the lock file
-- verify required shared libraries are present in the final image
-- validate `LD_LIBRARY_PATH` or equivalent runtime path only when the driver requires it
-- record Oracle client version, driver version, and connectivity mode in Runtime Contract, Runtime Lineage, and Build Report
+network:
+  mode: closed-network            # closed-network | proxy-only | internet-allowed
+  mirrors:                        # All endpoints must be internal in closed-network mode
+    nexus_pypi: https://nexus.example/repository/pypi-wheels
+    harbor: harbor.example/ml
+    base_images: harbor.example/base
+    os_packages: https://mirror.example/os
+    model_bucket: s3://ml-artifacts/models
 
-Fail or require approval when the Oracle client version is missing, when Python driver and client mode are incompatible, or when the final image accidentally drops required shared libraries during size optimization.
+index:
+  path: .build/index.json         # Generated build input index
+  exclude: [".opencode", ".git", ".venv", "datasets", "models/raw"]
 
-## Runtime Lineage
+runtime_matrix:
+  - variant_id: py310-cpu-mlflow214-oracle21-serving
+    image_category: serving
+    platform: linux/amd64
+    python: "3.10.14"
+    python_abi: cp310
+    runtime_contract: serving-py310-cpu@sha256:...
+    parent_image: harbor.example/base/python@sha256:...
+    framework:
+      fastapi: "0.115.0"
+      mlflow: "2.14.3"            # User-provided version is authoritative
+    oracle:
+      client: "21.13"             # Oracle client/Instant Client version
+      driver: "oracledb==2.4.1"   # Python package must match the lock file
+    lock_file: locks/serving-py310.lock
+    lock_hash: sha256:...
+    wheelhouse_key: serving/cp310/linux-amd64/<lock_hash>
 
-Track images through this chain:
+artifacts:
+  model_packaging: image          # external | oci-artifact | image
+  manifest: s3://ml-artifacts/models/model-manifest.json
+  checksum: sha256:...            # Cache and release decisions use checksum
 
-```text
-Trusted Base -> Runtime -> Framework -> Application Base -> Application Release
+build:
+  target: release-with-model      # dependencies | test | release | release-with-model
+  cache_repo: harbor.example/cache/my-service
+  release_repo: harbor.example/ml/my-service
+  tag: my-service-abc1234         # Do not use latest as deployable tag
+
+report:
+  path: reports/build-report.json
 ```
 
-Record at least:
+## Runtime Contract And Matrix
 
-- lineage id and version
-- runtime variant id when matrix builds are used
-- image role/category
-- project or service owner
-- parent image digest
-- runtime/framework/application-base digest chain
-- source commit
-- lock hash
-- builder spec hash
-- Dockerfile hash
-- BuildKit/Bake hash
-- final image digest
-- SBOM/provenance/signature status
+Use one matrix row per supported combination of Python, ABI, platform, CUDA, framework, MLflow, Oracle, and image category.
 
-Use Runtime Lineage as the approval unit when deciding whether a build may release.
+For each row:
 
-## Dockerfile And BuildKit Rules
+- produce a separate image digest and Build Report entry
+- use a separate lock hash, wheelhouse key, and BuildKit cache scope
+- validate Nexus wheels against Python ABI and platform
+- validate Oracle client libraries and Python driver compatibility when declared
+- compare environments by variant id, ABI, platform, framework versions, lock hash, parent digest, and spec hash
+- reject undeclared cross-product combinations
 
-Use one multi-stage Dockerfile built by BuildKit. Do not split Docker image layers into many Argo tasks.
+For Argo, expand the matrix only after spec validation. Limit Nexus, BuildKit, bucket, and Harbor concurrency independently.
 
-Prefer these stages:
+## Version Policies
+
+Python:
+
+- Require exact Python version and ABI, such as `3.10.14` and `cp310`.
+- Do not reuse dependency layers across different ABI values.
+- Record requested and installed Python versions in Runtime Contract and Build Report.
+
+MLflow:
+
+- Do not pin MLflow to latest by default.
+- Use the user-provided spec or lock version as authoritative.
+- Include MLflow only when training, serving, or batch runtime actually uses MLflow APIs or model format.
+- Fail when spec, lock file, Nexus wheel, and installed package metadata disagree.
+
+Oracle:
+
+- Do not infer or auto-upgrade Oracle client versions.
+- Record Oracle client/Instant Client separately from Python drivers such as `oracledb` or `cx_Oracle`.
+- Verify required shared libraries and runtime library paths in the final image.
+- Fail when client mode, Python driver, or target database compatibility is unclear.
+
+## Nexus, Wheelhouse, And uv
+
+Closed-network flow:
 
 ```text
-base -> dependencies -> test -> release
+validate spec -> prepare wheelhouse from Nexus -> verify lock/hash -> BuildKit offline install
+```
+
+Rules:
+
+- Use wheel-only dependencies from Nexus.
+- Do not allow public PyPI fallback.
+- Report wheel count, total bytes, download seconds, and cache hit/miss.
+- Install offline inside BuildKit from the prepared wheelhouse.
+- For uv, run dependency preparation once with `uv sync --frozen` or equivalent.
+- Use `uv run --no-sync` for short commands after correctness is established.
+- Use a persistent uv cache keyed by Python ABI, platform, lock hash, and runtime variant.
+- Set filesystem link mode, such as `UV_LINK_MODE=copy`, when links are slow or unsupported.
+
+## Dockerfile, BuildKit, And Size
+
+Use one multi-stage Dockerfile:
+
+```text
+base -> dependencies -> test -> release -> release-with-model
 ```
 
 Keep cache-sensitive order:
 
 ```text
-Runtime Image -> Lock File -> Wheelhouse -> Dependency Install -> Application Source -> Runtime Configuration
+Runtime Image -> Lock File -> Wheelhouse -> Dependency Install -> Source -> Runtime Config -> Model
 ```
 
 Rules:
 
-- Copy lock files before source files.
-- Copy wheelhouse before dependency install.
-- Keep tests and build tools out of the final release image.
-- Decide model packaging before writing the final stage; do not assume PVC/NAS exists.
-- Use `USER` with a non-root UID in final images.
+- Copy lock files before application source.
+- Keep wheelhouse, compilers, headers, tests, notebooks, and scan tools out of release images.
+- Prefer digest-pinned `FROM` images and non-root final users.
 - Ban `latest` as the only deployable tag.
-- Prefer digest-pinned `FROM` images.
-- Use `.dockerignore` to exclude `.git`, virtualenvs, caches, notebooks, datasets, models, test outputs, and local artifacts.
+- Use `.dockerignore` for `.git`, `.opencode`, virtualenvs, caches, notebooks, datasets, raw models, test outputs, and local artifacts.
+- Use slim/runtime bases for serving; avoid CUDA `devel` images in serving releases.
+- Report final image size, largest layers, and model contribution.
+- Do not remove CA certificates, timezone/locale data, health checks, or required diagnostics.
 
-## Image Size Optimization
+## Model And Bucket Artifacts
 
-Optimize release image size without breaking reproducibility, cache reuse, or startup reliability.
+If PVC/NAS is unavailable, choose one:
 
-Use this priority order:
+- object storage or model registry pull at startup when network and credentials are reliable
+- OCI artifact/model layer in Harbor when supported
+- model-in-image when startup reliability matters more than image size or rollout speed
 
-1. Separate `training`, `serving`, and `batch` images so serving images do not include training/debug tools.
-2. Use multi-stage builds so compilers, build tools, wheelhouse, tests, and scan tools stay out of release images.
-3. Use slim/runtime base images for release; avoid CUDA `devel` images in serving releases.
-4. Keep dependency, application, and model layers separate so model changes do not reinstall Python packages.
-5. Remove package manager caches in the same layer that creates them.
-6. Exclude large or volatile files through `.dockerignore`.
-7. Measure final image size and largest layers before calling the build optimized.
+Bucket performance rules:
 
-Release images must not contain:
-
-- `tests`, notebooks, training-only scripts, or local fixtures
-- compilers, headers, `build-essential`, Git, curl/wget unless needed at runtime
-- wheelhouse, pip/uv cache, apt cache, BuildKit metadata
-- `.git`, `.venv`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`
-- datasets, temporary outputs, profiling dumps, and unused model variants
-- credentials, config with secrets, or registry/package tokens
-
-For Python:
-
-- Prefer wheel-only installs from Nexus.
-- Use `--no-cache-dir` for pip when not using a BuildKit cache mount.
-- Prefer installing into a deterministic prefix such as `/opt/python-dependencies`.
-- Remove `.pyc` and test data only when the runtime does not need them.
+- Avoid recursive prefix listing during every build.
+- Read a small manifest first, then use `HEAD` or metadata checks before large downloads.
+- Cache by object URI, version/id, size, checksum, and runtime variant.
+- Download only changed objects.
+- Use bounded multipart/parallel download; cap concurrency so the backend is not saturated.
+- Stage shared artifacts once per Argo workflow and reuse them across matrix rows.
+- Index model metadata and checksums, not raw model binaries.
 
 For model-in-image:
 
-- Put model files in a late layer or `release-with-model` target.
-- Keep `release-without-model` buildable for test/scan comparison.
-- Report model size separately from application/runtime size.
-- Flag rollout risk when model size dominates the image.
-
-Do not chase tiny images by removing files needed for observability, health checks, CA certificates, timezone/locale support, or runtime diagnostics required by operations.
-
-## Model Packaging Without PVC/NAS
-
-If PVC/NAS is unavailable, prefer one of these options:
-
-1. Object storage or model registry pull at startup, if network and credentials are reliable.
-2. OCI artifact/model layer in Harbor, referenced by digest, if the platform supports artifact retrieval.
-3. Model-in-image, when startup reliability matters more than image size or rollout speed.
-
-When using model-in-image:
-
-- Copy model artifacts after dependency install and application source decisions, so dependency cache remains reusable.
-- Store model files under a stable path such as `/models/<model-name>`.
-- Record model name, version, format, size, checksum, and source in the build report.
-- Add model checksum or model artifact digest to the image label and Runtime Lineage catalog.
-- Keep model files out of base, runtime, framework, and application-base images; include them only in release images or a dedicated model-release target.
-- Avoid rebuilding dependency layers when only the model changes.
-- Scan and sign the final image after the model is included.
-- Call out rollout cost when model size makes image pull slow.
-
-Recommended target split when models are packaged into images:
-
-```text
-dependencies -> test -> release-without-model -> release-with-model
-```
-
-Use `release-with-model` only for deployable images that intentionally include model artifacts.
-
-## Nexus Wheelhouse Flow
-
-In closed-network builds, separate package preparation from image building:
-
-```text
-validate spec -> download wheels from Nexus -> verify lock/hash -> BuildKit offline install
-```
-
-Use Nexus only in the dependency preparation step. BuildKit should install offline from wheelhouse:
-
-```bash
-python -m pip install --no-index --find-links=/build/wheelhouse \
-  --only-binary=:all: --prefix=/opt/python-dependencies \
-  -r /build/requirements.lock
-```
-
-Check:
-
-- all required wheels exist in Nexus
-- source distributions are not used in release paths unless explicitly approved
-- wheel count and total bytes are reported
-- Nexus download time is measured
-- dependency cache hit/miss is explained
-- Nexus, BuildKit, and Harbor concurrency limits are independent
-
-For uv projects, avoid repeated `uv run` sync in short tasks. Prepare dependencies once with `uv sync --frozen` or an equivalent wheel preparation step, then use `uv run --no-sync` only after correctness is established.
+- Copy model files after dependency install and application source decisions.
+- Store under a stable path such as `/models/<model-name>`.
+- Record model name, version, format, size, checksum, and source.
+- Keep model files out of base, runtime, framework, and application-base images.
+- Scan, sign, and report the final image after the model is included.
 
 ## OpenCode Closed-Network Performance
 
-When OpenCode runs in a closed network, optimize for zero external wait and high cache reuse before changing Dockerfiles.
+Preflight before build:
 
-Do not repeatedly search the whole project during each build. Create a project build index, then use the index and file hashes to decide what must be rebuilt.
-
-Index only build-relevant inputs:
-
-- builder spec files such as `image-builder.spec.json`
-- Dockerfiles, Bake files, Argo workflow templates, and KServe manifests
-- dependency files: `pyproject.toml`, `uv.lock`, `requirements*.txt`, lock files, constraints, wheelhouse manifests
-- runtime contract, Runtime Lineage, and image catalog files
-- model metadata files, not raw model binaries unless the checksum changed
-- `.dockerignore`, build scripts, entrypoints, health checks, and package manager config
-
-Exclude non-build paths by default:
-
-- `.opencode`, because it contains agent skills/configuration, not application build inputs
-- `.git`, `.venv`, virtualenvs, caches, test outputs, notebooks, datasets, model binaries, and generated reports
-- dependency/download caches such as pip, uv, BuildKit metadata, wheelhouse output, and package manager caches
-
-Include `.opencode` only when the task is explicitly updating OpenCode skills or configuration; never let application image rebuild decisions depend on scanning `.opencode`.
-
-The index should record file path, size, mtime, checksum, detected role, related runtime variant, and cache key contribution. Rebuild the index only when Git diff, file watcher events, or checksum comparison shows relevant changes.
-
-Use the index to:
-
-- skip dependency resolution when lock/spec/runtime contract hashes did not change
-- skip wheelhouse preparation when wheelhouse manifest and lock hash match
-- skip Dockerfile rendering when templates and spec hash did not change
-- scope Argo matrix rows to changed runtime variants
-- explain cache hit/miss without scanning the whole repository
-
-Run a preflight before build:
-
-- verify every configured endpoint is internal: Git, Nexus, Harbor, base image registry, OS package mirror, model registry/object store, SBOM/signing endpoints
-- load or refresh the project build index before dependency and Docker steps
-- fail fast when a tool tries to reach public PyPI, Docker Hub, GitHub, apt/yum upstreams, or model download URLs
-- check DNS, TLS, proxy, and credentials once, then reuse the result across matrix rows
-- resolve parent image digests before BuildKit starts
+- verify internal endpoints: Git, Nexus, Harbor, base images, OS mirror, bucket/model store, SBOM/signing
+- fail fast on public PyPI, Docker Hub, GitHub, apt/yum upstream, or external model URLs
+- check DNS, TLS, proxy, and credentials once, then reuse results across matrix rows
+- resolve parent digests before BuildKit starts
 - verify wheelhouse completeness before dependency install
 - import BuildKit registry cache before building
 
-Performance defaults:
+Project indexing:
 
-- set pip/uv to offline or internal-index mode; do not allow fallback to the internet
-- use a persistent uv cache and wheelhouse keyed by `python_abi`, platform, lock hash, and runtime variant
-- use `uv run --no-sync` for short commands after `uv sync --frozen` has succeeded
-- fetch bucket artifacts by manifest/checksum, not recursive list operations
-- cache bucket downloads by object URI, version/id, size, checksum, and runtime variant
-- keep `UV_LINK_MODE=copy` or another environment-approved mode when filesystem links are slow or unsupported
-- keep Argo workspaces, BuildKit cache, and wheelhouse storage on fast internal storage
-- cap matrix concurrency to protect Nexus and Harbor; increase BuildKit concurrency only after cache hit rate is healthy
-- separate BuildKit cache images from release images, and prune only by policy, not on every run
-- prefer prebuilt runtime/framework images over rebuilding heavy dependency layers per project
+- Index only build inputs: specs, Dockerfiles, Bake files, Argo templates, KServe manifests, dependency locks, Runtime Contract, Runtime Lineage, image catalog, `.dockerignore`, scripts, entrypoints, health checks, and package manager config.
+- Exclude `.opencode`, `.git`, `.venv`, caches, test outputs, notebooks, datasets, raw model binaries, generated reports, wheelhouse output, and package manager caches.
+- Include `.opencode` only for OpenCode skill/config updates.
+- Record path, size, mtime, checksum, role, runtime variant, and cache key contribution.
+- Rebuild the index only when Git diff, file watcher events, or checksum comparison shows relevant changes.
 
-For slow bucket/model artifact reads:
-
-- avoid listing large prefixes during every build; read a small manifest file first
-- use `HEAD` or metadata checks before downloading large objects
-- download only changed objects; skip when checksum and size match the local or shared cache
-- use bounded multipart/parallel download; cap concurrency so the bucket backend is not saturated
-- stage shared artifacts once per workflow and reuse them across matrix rows
-- keep raw model binaries out of the project index; index only model metadata and checksums
-
-Measure and report:
-
-- preflight seconds
-- project index refresh seconds and changed input count
-- bucket list/head/download seconds, bytes, object count, and cache hit/miss
-- Nexus wheel lookup/download seconds
-- uv sync seconds and `uv run` seconds
-- BuildKit cache import/export seconds and cache hit rate
-- base image pull seconds
-- Harbor push seconds
-- Argo queue/wait seconds per step
-
-If a closed-network build is slow, first identify whether time is spent waiting for blocked external URLs, missing mirrors, full project scans, bucket artifact reads, cold wheelhouse, repeated uv sync, BuildKit cache miss, image pull/push, or Argo scheduling.
+Use the index to skip dependency resolution, wheelhouse preparation, Dockerfile rendering, unchanged Argo matrix rows, and full-repository scans.
 
 ## Builder Pipeline
 
@@ -395,6 +236,7 @@ validate-build-spec
   -> verify-runtime-contract
   -> resolve-parent-digest
   -> prepare-wheelhouse-from-nexus
+  -> prepare-or-verify-bucket-artifacts
   -> render-dockerfile
   -> generate-bake-targets
   -> build-dependency-or-test-target
@@ -408,88 +250,58 @@ validate-build-spec
   -> publish-build-report
 ```
 
-Quality gates must pass before release push, unless the organization uses a quarantine registry. If quarantine is used, promote only after gates pass.
-
-Sign only immutable references such as `repository@sha256:...`.
+Push only release targets after gates pass, unless a quarantine registry is explicitly used. Sign only immutable references such as `repository@sha256:...`.
 
 ## Build Report
 
-Every successful or failed build should produce a machine-readable report.
+Every build should produce JSON with:
 
-Include:
+- workflow name, UID, status, timestamp
+- spec hash, source commit, network mode, preflight result
+- project index hash, refresh seconds, changed input count
+- runtime variant id, matrix row hash, image category, Runtime Contract
+- parent digest, final digest, lineage id/version
+- Python ABI/version, CUDA/framework versions, MLflow version, Oracle client/driver versions
+- lock file, lock hash, Nexus repository, wheel count/bytes/download seconds
+- uv sync seconds, uv run seconds, offline/index mode
+- bucket source, checksum, bytes, object count, download seconds, cache hit/miss
+- BuildKit cache import/export seconds, cache hit rate
+- base image pull seconds, build seconds, Harbor push seconds, Argo queue/wait seconds
+- model packaging mode, model metadata, final image size, largest layer contributors
+- SBOM/provenance/signature status, non-root/latest/digest policy result
+- failure step, reason, and triage category
 
-- workflow name, workflow UID, status, timestamp
-- builder spec hash
-- source repository and commit
-- network mode and closed-network preflight result
-- project index hash, refresh seconds, and changed input count when indexing is used
-- bucket/object artifact source, checksum, bytes, download seconds, and cache hit/miss when used
-- runtime variant id and matrix row hash when matrix builds are used
-- image category and runtime contract
-- runtime lineage id/version
-- parent image digest and final image digest
-- Python ABI, Python version, CUDA/framework versions
-- requested and installed MLflow versions when MLflow is used
-- requested and installed Oracle client and Python Oracle driver versions when Oracle is used
-- lock file name and lock hash
-- Nexus repository
-- wheel count, total bytes, download seconds, average throughput
-- dependency cache hit/miss
-- uv sync seconds, uv run seconds, and offline/index mode when uv is used
-- BuildKit cache import/export seconds and cache hit rate when available
-- base image pull seconds and Argo queue/wait seconds when available
-- model packaging mode, model name/version/checksum/size when present
-- final image size, release-without-model size when available, and largest layer contributors
-- BuildKit cache hit/miss when available
-- build seconds and Harbor push seconds
-- SBOM/provenance/signature status
-- non-root/latest/digest policy result
-- failure step and reason
-
-Use the report to explain whether the bottleneck is Nexus download, dependency install, BuildKit build, Harbor push, or runtime rollout.
+Use the report to identify whether the bottleneck is indexing, blocked external access, Nexus, uv, bucket, BuildKit, Harbor, image size, rollout, or Argo scheduling.
 
 ## Review Checklist
 
-When reviewing or generating an image builder, check:
+Check:
 
-- A declarative builder spec exists and is validated before rendering.
-- Closed-network mode has explicit internal mirrors, offline behavior, and a preflight gate.
-- OpenCode uses a project build index instead of repeated full-repository scans.
-- Bucket artifacts use manifest/checksum caching instead of repeated large prefix scans.
-- Runtime Contract is explicit and digest-based.
-- Multiple Python/framework/runtime versions are represented as explicit matrix variants, not hidden conditionals inside one image.
-- Same-environment comparison uses ABI/framework/Python/platform/lock/spec, not image name alone.
-- Training, serving, and batch images are separated.
-- Dockerfile stages are `base`, `dependencies`, `test`, and `release` or an equivalent clear structure.
-- Dependency layers are isolated from application source layers.
-- Nexus wheelhouse is prepared once and BuildKit installs offline.
-- uv does not repeatedly sync for short commands after frozen dependency preparation succeeds.
-- Release image excludes tests, compilers, wheelhouse, caches, and credentials.
-- MLflow is included only when needed, pinned to the user-provided version, resolved from Nexus wheels, and recorded in the report.
-- Oracle client and Python Oracle driver versions are pinned, validated in the final image, and recorded when Oracle is used.
-- Release image size is measured; large layers and model contribution are reported.
-- Models are either externalized through supported infrastructure or intentionally packaged with digest/checksum/report metadata.
-- Runtime Lineage and Image Catalog record parent and final digests.
-- BuildKit registry cache is separate from final Harbor image repositories.
-- Only release images are pushed to deployable repositories after gates pass.
-- Digest, lock hash, non-root user, latest tag ban, report, SBOM/provenance/signature rules are enforced.
+- spec exists and is validated before rendering
+- closed-network mode has internal mirrors, offline behavior, and preflight
+- `.opencode` is excluded from application build indexing
+- Runtime Contract is explicit and digest-based
+- matrix variants represent multiple Python/framework/runtime combinations
+- Nexus wheelhouse is prepared once and BuildKit installs offline
+- uv does not repeatedly sync for short commands
+- bucket artifacts use manifest/checksum caching instead of repeated prefix scans
+- training, serving, and batch images are separated
+- release image excludes tests, compilers, wheelhouse, caches, credentials, and raw unused artifacts
+- MLflow, Oracle, and Python versions are pinned, validated, and reported
+- BuildKit cache repos are separate from Harbor release repos
+- SBOM/provenance/signature, non-root, latest ban, digest pinning, and report rules are enforced
 
 ## Failure Triage
 
-Classify failures before changing code:
-
-- Nexus slow: check wheel-only availability, download concurrency, wheelhouse reuse, and response timing.
-- OpenCode indexing slow: check index scope, checksum strategy, ignored directories such as `.opencode` and `.git`, large model/data files, file watcher availability, and changed input count.
-- Closed-network slow: check blocked external URL attempts, missing internal mirrors, DNS/proxy/TLS delays, full project scans, cold wheelhouse, cold BuildKit cache, and Argo queue time.
-- Bucket slow: check prefix listing, missing manifest, object count, object size, checksum cache, multipart settings, concurrency, and workflow artifact reuse.
-- uv slow: check repeated sync, stale lock, cache path, workspace discovery, offline index configuration, filesystem link mode, and whether `--no-sync` is safe.
-- BuildKit slow: check dependency layer invalidation, registry cache import/export, builder CPU/memory, and `.dockerignore`.
-- Harbor push slow: check image size, push concurrency, release/cache repository split, and network throughput.
-- Image too large: check image category separation, CUDA devel base usage, build tools in release, wheelhouse/cache leakage, `.dockerignore`, model layer size, and unused dependencies.
-- Model image rollout slow: check model size, image pull time, node cache reuse, rollout strategy, and whether model-in-image is still the right tradeoff.
-- Reproducibility failure: compare runtime contract, parent digest, lock hash, Dockerfile hash, builder spec hash, source commit, and build args.
-- Runtime mismatch: compare Python ABI, CUDA/framework versions, platform, and Runtime Lineage.
-- Matrix mismatch: compare variant id, matrix row hash, lock file, parent digest, cache scope, and intended image category.
-- MLflow mismatch: compare builder spec, lock file, Nexus wheel version, installed package metadata, and runtime category need.
-- Oracle mismatch: compare builder spec, Oracle client libraries, Python driver version, runtime library path, final image contents, and target database compatibility.
-- Security failure: check non-root user, latest tag, digest pinning, SBOM/provenance/signature, and credential handling.
+- OpenCode indexing slow: check index scope, `.opencode`/`.git` ignores, large model/data files, checksum strategy, file watcher, and changed input count.
+- Closed-network slow: check blocked external URLs, missing mirrors, DNS/proxy/TLS delays, full scans, cold caches, and Argo queue time.
+- Nexus slow: check wheel-only availability, wheelhouse reuse, download concurrency, and response timing.
+- uv slow: check repeated sync, stale lock, cache path, workspace discovery, offline index, link mode, and `--no-sync`.
+- Bucket slow: check prefix listing, missing manifest, object count/size, checksum cache, multipart settings, concurrency, and workflow reuse.
+- BuildKit slow: check dependency layer invalidation, cache import/export, builder CPU/memory, and `.dockerignore`.
+- Harbor push slow: check image size, push concurrency, release/cache repo split, and network throughput.
+- Image too large: check category separation, CUDA devel base, build tools, wheelhouse/cache leakage, `.dockerignore`, model layer size, and unused dependencies.
+- Model rollout slow: check model size, image pull time, node cache reuse, rollout strategy, and model-in-image tradeoff.
+- Runtime mismatch: compare ABI, Python, CUDA/framework, MLflow, Oracle, platform, Runtime Contract, and Runtime Lineage.
+- Reproducibility failure: compare parent digest, lock hash, Dockerfile hash, spec hash, source commit, build args, and final digest.
+- Security failure: check non-root user, latest tags, digest pinning, SBOM/provenance/signature, and credential handling.
