@@ -160,7 +160,7 @@ Oracle:
 - Verify required shared libraries and runtime library paths in the final image.
 - Fail when client mode, Python driver, or target database compatibility is unclear.
 
-## Nexus, Wheelhouse, And uv
+## Nexus, Wheelhouse, uv, And pip
 
 Closed-network flow:
 
@@ -174,9 +174,15 @@ Rules:
 - Do not allow public PyPI fallback.
 - Report wheel count, total bytes, download seconds, and cache hit/miss.
 - Install offline inside BuildKit from the prepared wheelhouse.
+- Prefer uv for lock, resolve, sync, and local developer commands because it is usually faster.
+- Use `uv pip` or pip for final offline wheelhouse installation; choose one installer per image stage and record it.
 - For uv, run dependency preparation once with `uv sync --frozen` or equivalent.
 - Use `uv run --no-sync` for short commands after correctness is established.
 - Use a persistent uv cache keyed by Python ABI, platform, lock hash, and runtime variant.
+- Use BuildKit cache mounts for uv/pip caches in dependency stages, but keep those caches out of release images.
+- Use pip with `--no-index --find-links` or uv with equivalent offline wheelhouse flags after the wheelhouse is complete.
+- Do not use `extra-index-url` pointing outside the closed network; fail fast instead of falling back.
+- Run `pip check` or `uv pip check` after install and include result in the Build Report.
 - Set filesystem link mode, such as `UV_LINK_MODE=copy`, when links are slow or unsupported.
 
 ## Dockerfile, BuildKit, And Size
@@ -301,7 +307,7 @@ Every build should produce JSON with:
 - Python ABI/version, CUDA/framework versions, MLflow version, Oracle client/driver versions
 - PyTorch, torchvision, torchaudio, and CPU/CUDA runtime expectation
 - lock file, lock hash, Nexus repository, wheel count/bytes/download seconds
-- uv sync seconds, uv run seconds, offline/index mode
+- uv lock/sync/run seconds, pip or uv-pip install seconds, installer name, offline/index mode, dependency check result
 - bucket source, checksum, bytes, object count, download seconds, cache hit/miss
 - BuildKit cache import/export seconds, cache hit rate
 - base image pull seconds, build seconds, Harbor push seconds, Argo queue/wait seconds
@@ -322,7 +328,7 @@ Check:
 - PyTorch is the representative framework pattern, not the only supported framework
 - matrix variants represent multiple Python/framework/runtime combinations
 - Nexus wheelhouse is prepared once and BuildKit installs offline
-- uv does not repeatedly sync for short commands
+- uv handles lock/sync/run efficiently, pip or uv-pip installs offline from wheelhouse, and short commands avoid repeated sync
 - bucket artifacts use manifest/checksum caching instead of repeated prefix scans
 - multiple PyTorch models are declared in a manifest and have explicit packaging, rollout, and cache policy
 - training, serving, and batch images are separated
@@ -337,7 +343,7 @@ Check:
 - OpenCode indexing slow: check index scope, `.opencode`/`.git` ignores, large model/data files, checksum strategy, file watcher, and changed input count.
 - Closed-network slow: check blocked external URLs, missing mirrors, DNS/proxy/TLS delays, full scans, cold caches, and Argo queue time.
 - Nexus slow: check wheel-only availability, wheelhouse reuse, download concurrency, and response timing.
-- uv slow: check repeated sync, stale lock, cache path, workspace discovery, offline index, link mode, and `--no-sync`.
+- uv/pip slow: check repeated sync, stale lock, cache mount, wheelhouse completeness, installer choice, workspace discovery, offline index, link mode, dependency check, and `--no-sync`.
 - Bucket slow: check prefix listing, missing manifest, object count/size, checksum cache, multipart settings, concurrency, and workflow reuse.
 - BuildKit slow: check dependency layer invalidation, cache import/export, builder CPU/memory, and `.dockerignore`.
 - Harbor push slow: check image size, push concurrency, release/cache repo split, and network throughput.
