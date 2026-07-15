@@ -45,7 +45,7 @@ Implement and review against these requirements:
 4. Training/Serving Separation: keep training, serving, and batch images separate; distinguish strict and optimized runtime patterns.
 5. Declarative Builder Spec: centralize layer, target, validation, and report rules.
 6. Multi-stage Target: separate dependency, test, and release targets; push only release targets after gates pass.
-7. Externalize Models: do not bake model artifacts into application images unless explicitly required; inject models through artifact storage, PVC, object storage, or runtime loading.
+7. Model Packaging Policy: externalize models only when the platform supports it; when PVC/NAS is unavailable, allow model-in-image with strict digest, size, cache, and release controls.
 8. Security and Reproducibility: require digest, lock hash, non-root user, latest tag ban, report, and policy checks.
 9. Wheel Repository: use Nexus wheel-only download and dependency cache reuse.
 
@@ -128,11 +128,38 @@ Rules:
 - Copy lock files before source files.
 - Copy wheelhouse before dependency install.
 - Keep tests and build tools out of the final release image.
-- Keep model artifacts out of the image by default.
+- Decide model packaging before writing the final stage; do not assume PVC/NAS exists.
 - Use `USER` with a non-root UID in final images.
 - Ban `latest` as the only deployable tag.
 - Prefer digest-pinned `FROM` images.
 - Use `.dockerignore` to exclude `.git`, virtualenvs, caches, notebooks, datasets, models, test outputs, and local artifacts.
+
+## Model Packaging Without PVC/NAS
+
+If PVC/NAS is unavailable, prefer one of these options:
+
+1. Object storage or model registry pull at startup, if network and credentials are reliable.
+2. OCI artifact/model layer in Harbor, referenced by digest, if the platform supports artifact retrieval.
+3. Model-in-image, when startup reliability matters more than image size or rollout speed.
+
+When using model-in-image:
+
+- Copy model artifacts after dependency install and application source decisions, so dependency cache remains reusable.
+- Store model files under a stable path such as `/models/<model-name>`.
+- Record model name, version, format, size, checksum, and source in the build report.
+- Add model checksum or model artifact digest to the image label and Runtime Lineage catalog.
+- Keep model files out of base, runtime, framework, and application-base images; include them only in release images or a dedicated model-release target.
+- Avoid rebuilding dependency layers when only the model changes.
+- Scan and sign the final image after the model is included.
+- Call out rollout cost when model size makes image pull slow.
+
+Recommended target split when models are packaged into images:
+
+```text
+dependencies -> test -> release-without-model -> release-with-model
+```
+
+Use `release-with-model` only for deployable images that intentionally include model artifacts.
 
 ## Nexus Wheelhouse Flow
 
@@ -204,6 +231,7 @@ Include:
 - Nexus repository
 - wheel count, total bytes, download seconds, average throughput
 - dependency cache hit/miss
+- model packaging mode, model name/version/checksum/size when present
 - BuildKit cache hit/miss when available
 - build seconds and Harbor push seconds
 - SBOM/provenance/signature status
@@ -223,7 +251,8 @@ When reviewing or generating an image builder, check:
 - Dockerfile stages are `base`, `dependencies`, `test`, and `release` or an equivalent clear structure.
 - Dependency layers are isolated from application source layers.
 - Nexus wheelhouse is prepared once and BuildKit installs offline.
-- Release image excludes tests, compilers, wheelhouse, caches, models, and credentials.
+- Release image excludes tests, compilers, wheelhouse, caches, and credentials.
+- Models are either externalized through supported infrastructure or intentionally packaged with digest/checksum/report metadata.
 - Runtime Lineage and Image Catalog record parent and final digests.
 - BuildKit registry cache is separate from final Harbor image repositories.
 - Only release images are pushed to deployable repositories after gates pass.
@@ -237,6 +266,7 @@ Classify failures before changing code:
 - uv slow: check repeated sync, stale lock, cache path, workspace discovery, and whether `--no-sync` is safe.
 - BuildKit slow: check dependency layer invalidation, registry cache import/export, builder CPU/memory, and `.dockerignore`.
 - Harbor push slow: check image size, push concurrency, release/cache repository split, and network throughput.
+- Model image rollout slow: check model size, image pull time, node cache reuse, rollout strategy, and whether model-in-image is still the right tradeoff.
 - Reproducibility failure: compare runtime contract, parent digest, lock hash, Dockerfile hash, builder spec hash, source commit, and build args.
 - Runtime mismatch: compare Python ABI, CUDA/framework versions, platform, and Runtime Lineage.
 - Security failure: check non-root user, latest tag, digest pinning, SBOM/provenance/signature, and credential handling.
