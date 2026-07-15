@@ -1,6 +1,6 @@
 ---
 name: nexus-image-builder
-description: Use when creating, reviewing, or debugging a PyTorch-focused AI/ML container image builder for OpenCode in a closed network, with Nexus wheel-only dependencies, BuildKit, Harbor, Argo Workflows, KServe serving images, Runtime Contract, runtime version matrices, multi-model packaging, Python/PyTorch/MLflow/Oracle checks, project indexing, bucket artifact performance, Docker size optimization, Build Reports, and failure triage.
+description: Use when creating, reviewing, or debugging an AI/ML container image builder for OpenCode in a closed network, using PyTorch as the representative framework pattern, with Nexus wheel-only dependencies, BuildKit, Harbor, Argo Workflows, KServe serving images, Runtime Contract, runtime version matrices, multi-model packaging, Python/framework/MLflow/Oracle checks, project indexing, bucket artifact performance, Docker size optimization, Build Reports, and failure triage.
 ---
 
 # Nexus AI/ML Image Builder
@@ -12,6 +12,7 @@ Use this skill to design or review an auditable AI/ML image builder. Optimize th
 - Treat Nexus as the only Python package source in closed-network builds.
 - Use BuildKit with registry cache; keep cache images separate from release images.
 - Build from a declarative spec, not hidden CI variables.
+- Treat PyTorch as the representative framework pattern; apply the same matrix, lock, wheel, smoke-test, and report rules to other ML frameworks.
 - Use Runtime Contract and Runtime Lineage for approval and reproducibility.
 - Separate `training`, `serving`, `batch`, `runtime-base`, `framework`, `application-base`, and `release` images.
 - Do not assume PVC/NAS exists. Support object storage, OCI model artifacts, or model-in-image with strict reporting.
@@ -135,7 +136,7 @@ Python:
 - Do not reuse dependency layers across different ABI values.
 - Record requested and installed Python versions in Runtime Contract and Build Report.
 
-PyTorch:
+Framework compatibility, with PyTorch as the representative case:
 
 - Treat `torch`, `torchvision`, `torchaudio`, Python ABI, platform, and CUDA/CPU runtime as one compatibility set.
 - Use the user-provided versions from the spec or lock file; do not auto-upgrade to latest.
@@ -143,6 +144,7 @@ PyTorch:
 - Prefer CUDA runtime bases for serving; keep CUDA devel/toolkit images for training/build stages only.
 - Verify PyTorch wheels are mirrored in Nexus for the target ABI/platform/runtime before BuildKit starts.
 - Run a smoke check that imports torch and verifies `torch.__version__`, CUDA availability expectation, and model load path.
+- For non-PyTorch frameworks, define the equivalent compatibility set, runtime/library expectation, Nexus artifacts, and smoke check in the same matrix row.
 
 MLflow:
 
@@ -317,6 +319,7 @@ Check:
 - closed-network mode has internal mirrors, offline behavior, and preflight
 - `.opencode` is excluded from application build indexing
 - Runtime Contract is explicit and digest-based
+- PyTorch is the representative framework pattern, not the only supported framework
 - matrix variants represent multiple Python/framework/runtime combinations
 - Nexus wheelhouse is prepared once and BuildKit installs offline
 - uv does not repeatedly sync for short commands
